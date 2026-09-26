@@ -2,6 +2,7 @@ use crate::config::{Config, NetGateway, Profile};
 use crate::list::LifecycleResidue;
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -46,14 +47,22 @@ pub trait SysInspect {
     fn iface_has_route(&self, name: &str) -> bool;
     fn iface_has_default_route(&self, name: &str) -> bool;
     fn path_exists(&self, path: &Path) -> bool;
+    /// 可执行位断言（provider 钉定路径；RealSys = metadata + mode & 0o111）。
+    fn path_executable(&self, path: &Path) -> bool;
     fn which(&self, bin: &str) -> Option<PathBuf>;
     fn command_output(&self, cmd: &str) -> Option<String>;
+    /// provider 版本事实（与 [`crate::provider::version_output`] 同规：`--version`
+    /// stdout 的首个非空行）；None = 不可测（drift 比对跳过为 Warn）。
+    fn provider_version(&self, path: &Path) -> Option<String>;
     fn locale_available(&self, lang: &str) -> bool;
     fn resolve_connect(&self, host: &str, port: u16) -> Result<(), String>;
     /// L3 sweep 注入缝（票 13）：孤儿网关 + 无主会话目录。default = 无 residue。
     fn lifecycle_residue(&self) -> LifecycleResidue {
         LifecycleResidue::default()
     }
+    /// 清单注入缝（票 14）：None = 清单缺失（setup 未跑）；Some = 条目集；
+    /// Err = 损坏/schema 未知（fail-loud）。
+    fn manifest_state(&self) -> Result<Option<Vec<crate::manifest::Entry>>, String>;
 }
 
 pub struct RealSys;
@@ -74,6 +83,11 @@ impl SysInspect for RealSys {
     fn path_exists(&self, path: &Path) -> bool {
         path.exists()
     }
+    fn path_executable(&self, path: &Path) -> bool {
+        std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
     fn which(&self, bin: &str) -> Option<PathBuf> {
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path)
@@ -86,6 +100,9 @@ impl SysInspect for RealSys {
             .output()
             .ok()?;
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+    fn provider_version(&self, path: &Path) -> Option<String> {
+        crate::provider::version_output(path).ok()
     }
     fn locale_available(&self, lang: &str) -> bool {
         let Ok(out) = std::process::Command::new("locale").arg("-a").output() else {
@@ -115,6 +132,13 @@ impl SysInspect for RealSys {
     }
     fn lifecycle_residue(&self) -> LifecycleResidue {
         crate::list::sweep_residue()
+    }
+    fn manifest_state(&self) -> Result<Option<Vec<crate::manifest::Entry>>, String> {
+        match crate::manifest::read() {
+            Ok(Some(m)) => Ok(Some(m.entries)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
     }
 }
 
@@ -230,22 +254,158 @@ pub fn run(
         ));
     }
 
-    // 4. provider（R11/D7）——按 config 选择的 gateway fail-loud（#2 过渡态：which + 显式
-    //    报错；绝对路径 + 版本钉定归 14 清单态）
+    // 4. 清单双向校验（票 14 清单态；替换 09 期 #2 过渡态：which + 显式报错）。
+    //    forward（清单→现实）：条目存在性、provider 可执行+版本一致（漂移 Warn/缺失
+    //    Fail）、挂载点存在（缺失 Fail = setup 未跑/被删）。
+    //    reverse（现实→清单）：stale 条目（指向已消失 profile）= Warn + prune 提示；
+    //    sweep 残留（§8 检查组，票 13）见第 8 节。诚实边界：不扫全盘，校验域 =
+    //    config 可推导路径 ∪ state_dir ∪ /proc。
     let gateway = profile.gateway();
     let bin_name = gateway.bin_name();
-    match sys.which(bin_name) {
-        Some(p) => out.push(Check::new(
-            "provider/selected",
-            Status::Ok,
-            format!("net.gateway={gateway} → {}", p.display()),
-        )),
-        None => out.push(Check::new(
-            "provider/selected",
-            Status::Fail,
-            format!("{bin_name} 不在 PATH（net.gateway={gateway}，fail-loud #2 过渡态；缺失报包名：passt / slirp4netns 或上游静态单文件）"),
-        )),
-    }
+    let entries: Vec<crate::manifest::Entry> = match sys.manifest_state() {
+        Err(e) => {
+            out.push(Check::new(
+                "manifest/state",
+                Status::Fail,
+                format!("清单不可读（fail-loud）：{e}"),
+            ));
+            out.push(Check::new(
+                "provider/selected",
+                Status::Fail,
+                format!("清单不可读，无法钉定 {bin_name}（fail-loud #2 清单态）：重跑 `iso-cc setup`"),
+            ));
+            Vec::new()
+        }
+        Ok(None) => {
+            out.push(Check::new(
+                "manifest/state",
+                Status::Fail,
+                format!(
+                    "清单缺失（{}；setup 未跑）——先运行 `iso-cc setup`",
+                    crate::manifest::manifest_path().display()
+                ),
+            ));
+            out.push(Check::new(
+                "provider/selected",
+                Status::Fail,
+                format!("net.gateway={gateway}：{bin_name} 绝对路径未钉定（fail-loud #2 清单态）——先运行 `iso-cc setup`；缺失报包名：passt / slirp4netns 或上游静态单文件"),
+            ));
+            Vec::new()
+        }
+        Ok(Some(entries)) => {
+            out.push(Check::new(
+                "manifest/state",
+                Status::Ok,
+                format!("{} entries", entries.len()),
+            ));
+            // forward：provider 条目 → 钉定路径可执行 + 版本一致
+            match entries.iter().find(|e| {
+                e.kind == crate::manifest::EntryKind::Provider && e.key == bin_name
+            }) {
+                None => out.push(Check::new(
+                    "provider/selected",
+                    Status::Fail,
+                    format!("net.gateway={gateway}：清单无 {bin_name} 条目（fail-loud #2 清单态）——先运行 `iso-cc setup --profile <n>`"),
+                )),
+                Some(entry) => {
+                    let path = entry.path.clone().unwrap_or_default();
+                    let executable = sys.path_executable(&path);
+                    if !executable {
+                        out.push(Check::new(
+                            "provider/selected",
+                            Status::Fail,
+                            format!("net.gateway={gateway}：钉定路径不可执行 {}（fail-loud #2 清单态）——重跑 `iso-cc setup`", path.display()),
+                        ));
+                    } else {
+                        let current = sys.provider_version(&path);
+                        let drifted = current.as_deref().is_some_and(|c| Some(c) != entry.version.as_deref());
+                        let status = if current.is_none() || drifted {
+                            Status::Warn
+                        } else {
+                            Status::Ok
+                        };
+                        let detail = match (&current, &entry.version) {
+                            (Some(c), Some(v)) if c != v => format!(
+                                "net.gateway={gateway} → {} 版本漂移：清单 {v:?} vs 现实 {c:?}（重跑 setup 收敛）",
+                                path.display()
+                            ),
+                            (None, _) => format!(
+                                "net.gateway={gateway} → {} 版本不可测（--version 失败）",
+                                path.display()
+                            ),
+                            _ => format!(
+                                "net.gateway={gateway} → {}（清单钉定，版本一致）",
+                                path.display()
+                            ),
+                        };
+                        out.push(Check::new("provider/selected", status, detail));
+                    }
+                }
+            }
+            // forward：挂载点条目存在性（缺失 Fail = setup 未跑或被删）
+            let missing: Vec<String> = entries
+                .iter()
+                .filter(|e| e.kind == crate::manifest::EntryKind::Mountpoint)
+                .filter(|e| e.path.as_ref().is_some_and(|p| !p.exists()))
+                .map(|e| e.key.clone())
+                .collect();
+            let mp_total = entries
+                .iter()
+                .filter(|e| e.kind == crate::manifest::EntryKind::Mountpoint)
+                .count();
+            if missing.is_empty() {
+                out.push(Check::new(
+                    "manifest/mountpoints",
+                    Status::Ok,
+                    format!("{mp_total} 挂载点条目全部在位"),
+                ));
+            } else {
+                out.push(Check::new(
+                    "manifest/mountpoints",
+                    Status::Fail,
+                    format!(
+                        "挂载点消失 ×{}：{}（setup 未跑或被删——重跑 `iso-cc setup`）",
+                        missing.len(),
+                        missing.join(", ")
+                    ),
+                ));
+            }
+            // reverse：stale 条目（指向已消失 profile）= Warn + prune 提示
+            let stale: Vec<String> = entries
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.kind,
+                        crate::manifest::EntryKind::Mountpoint
+                            | crate::manifest::EntryKind::ProfileState
+                    )
+                })
+                .filter_map(|e| {
+                    e.key.split_once(':').map(|(p, _)| p).and_then(|p| {
+                        (!_cfg.profile.contains_key(p)).then(|| e.key.clone())
+                    })
+                })
+                .collect();
+            if stale.is_empty() {
+                out.push(Check::new(
+                    "manifest/stale",
+                    Status::Ok,
+                    "无 stale 条目",
+                ));
+            } else {
+                out.push(Check::new(
+                    "manifest/stale",
+                    Status::Warn,
+                    format!(
+                        "指向已消失 profile 的条目 ×{}：{}（`iso-cc gc --prune` 清理登记簿）",
+                        stale.len(),
+                        stale.join(", ")
+                    ),
+                ));
+            }
+            entries
+        }
+    };
     // #11：slirp 模式 DNS 上游=宿主 resolver（内建转发器）→ R1 降级恒 Warn（P3b/P13 现形）
     if gateway == NetGateway::Slirp4netns {
         out.push(Check::new(
@@ -290,18 +450,38 @@ pub fn run(
         }
     }
 
-    // 7. 重定向挂载点预览（R4）
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    for (name, p) in [
-        ("~/.claude", PathBuf::from(&home).join(".claude")),
-        ("~/.claude.json", PathBuf::from(&home).join(".claude.json")),
-    ] {
-        let exists = sys.path_exists(&p);
-        out.push(Check::new(
-            "redirect/mountpoint",
-            if exists { Status::Ok } else { Status::Warn },
-            format!("{name} 存在性 = {exists}（缺失将预创建）"),
-        ));
+    // 7. redirect 挂载点登记核验（config 可推导 → 清单；票 14 run 零预创建的镜像断言）：
+    //    声明的 redirect dst 缺失且未登记 = setup 未跑，run 将 fail-loud → 这里 Fail。
+    {
+        let unregistered_missing: Vec<String> = profile
+            .redirect
+            .iter()
+            .filter_map(|r| r.split_once('=').map(|(_, dst)| dst.to_string()))
+            .filter(|dst| !Path::new(dst).exists())
+            .filter(|dst| {
+                !entries.iter().any(|e| {
+                    e.kind == crate::manifest::EntryKind::Mountpoint
+                        && e.path.as_ref().is_some_and(|p| p.to_string_lossy() == *dst)
+                })
+            })
+            .collect();
+        if unregistered_missing.is_empty() {
+            out.push(Check::new(
+                "manifest/redirect-registered",
+                Status::Ok,
+                format!("redirect {} 条（挂载点缺失 = 0 或已登记）", profile.redirect.len()),
+            ));
+        } else {
+            out.push(Check::new(
+                "manifest/redirect-registered",
+                Status::Fail,
+                format!(
+                    "redirect 挂载点缺失且未登记 ×{}：{}（run 将 fail-loud）——先运行 `iso-cc setup`",
+                    unregistered_missing.len(),
+                    unregistered_missing.join(", ")
+                ),
+            ));
+        }
     }
 
     // 8. lifecycle sweep（票 13 L3，fail-loud #10）：孤儿网关（pasta=argv 键 /
@@ -384,6 +564,25 @@ pub fn render_human(checks: &[Check]) -> String {
 mod tests {
     use super::*;
 
+    fn mentry(key: &str, path: &str, version: Option<&str>) -> crate::manifest::Entry {
+        crate::manifest::Entry {
+            kind: if key.contains(':') {
+                crate::manifest::EntryKind::Mountpoint
+            } else {
+                crate::manifest::EntryKind::Provider
+            },
+            key: key.into(),
+            path: Some(PathBuf::from(path)),
+            version: version.map(Into::into),
+            registered_at: 1_760_000_000_000,
+            reason: "测试登记".into(),
+        }
+    }
+
+    fn default_manifest() -> Vec<crate::manifest::Entry> {
+        vec![mentry("pasta", "/usr/bin/fake", Some("1.0.0"))]
+    }
+
     /// 最小 FakeSys：全部通过的基线，单测按需覆写。
     struct FakeSys {
         max_ns: String,
@@ -391,6 +590,8 @@ mod tests {
         iface: bool,
         default_route: bool,
         residue: LifecycleResidue,
+        manifest: Result<Option<Vec<crate::manifest::Entry>>, String>,
+        exec_ok: bool,
     }
 
     impl Default for FakeSys {
@@ -401,6 +602,8 @@ mod tests {
                 iface: true,
                 default_route: true,
                 residue: LifecycleResidue::default(),
+                manifest: Ok(Some(default_manifest())),
+                exec_ok: true,
             }
         }
     }
@@ -433,10 +636,16 @@ mod tests {
         fn path_exists(&self, _path: &Path) -> bool {
             true
         }
+        fn path_executable(&self, _path: &Path) -> bool {
+            self.exec_ok
+        }
         fn which(&self, _bin: &str) -> Option<PathBuf> {
             Some(PathBuf::from("/usr/bin/fake"))
         }
         fn command_output(&self, _cmd: &str) -> Option<String> {
+            Some("1.0.0".into())
+        }
+        fn provider_version(&self, _path: &Path) -> Option<String> {
             Some("1.0.0".into())
         }
         fn locale_available(&self, _lang: &str) -> bool {
@@ -447,6 +656,9 @@ mod tests {
         }
         fn lifecycle_residue(&self) -> LifecycleResidue {
             self.residue.clone()
+        }
+        fn manifest_state(&self) -> Result<Option<Vec<crate::manifest::Entry>>, String> {
+            self.manifest.clone()
         }
     }
 
@@ -533,10 +745,16 @@ mod tests {
             fn path_exists(&self, _: &Path) -> bool {
                 true
             }
+            fn path_executable(&self, _: &Path) -> bool {
+                true
+            }
             fn which(&self, _: &str) -> Option<PathBuf> {
                 Some(PathBuf::from("/x"))
             }
             fn command_output(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn provider_version(&self, _: &Path) -> Option<String> {
                 None
             }
             fn locale_available(&self, _: &str) -> bool {
@@ -544,6 +762,9 @@ mod tests {
             }
             fn resolve_connect(&self, _: &str, _: u16) -> Result<(), String> {
                 Ok(())
+            }
+            fn manifest_state(&self) -> Result<Option<Vec<crate::manifest::Entry>>, String> {
+                Ok(Some(default_manifest()))
             }
         }
         let checks = run(
@@ -624,6 +845,14 @@ mod tests {
     #[test]
     fn slirp_gateway_selection_and_dns_warn() {
         let p: Profile = toml::from_str("egress = 'if:wg0'\nnet.gateway = 'slirp4netns'").unwrap();
+        let sys = FakeSys {
+            manifest: Ok(Some(vec![mentry(
+                "slirp4netns",
+                "/usr/bin/fake",
+                Some("1.0.0"),
+            )])),
+            ..Default::default()
+        };
         let checks = run(
             &Config {
                 version: 1,
@@ -631,7 +860,7 @@ mod tests {
             },
             "x",
             &p,
-            &FakeSys::default(),
+            &sys,
         );
         assert!(!any_fail(&checks), "{checks:?}");
         assert!(checks
@@ -644,36 +873,11 @@ mod tests {
 
     #[test]
     fn missing_selected_provider_is_fail() {
-        struct NoBin;
-        impl SysInspect for NoBin {
-            fn which(&self, _: &str) -> Option<PathBuf> {
-                None
-            }
-            fn read_sysctl(&self, _: &str) -> io::Result<String> {
-                Err(io::Error::new(io::ErrorKind::NotFound, "n/a"))
-            }
-            fn iface_exists(&self, _: &str) -> bool {
-                true
-            }
-            fn iface_has_route(&self, _: &str) -> bool {
-                true
-            }
-            fn iface_has_default_route(&self, _: &str) -> bool {
-                true
-            }
-            fn path_exists(&self, _: &Path) -> bool {
-                true
-            }
-            fn command_output(&self, _: &str) -> Option<String> {
-                None
-            }
-            fn locale_available(&self, _: &str) -> bool {
-                true
-            }
-            fn resolve_connect(&self, _: &str, _: u16) -> Result<(), String> {
-                Ok(())
-            }
-        }
+        // 清单态 #2：provider 条目缺失 = Fail，提示 setup
+        let sys = FakeSys {
+            manifest: Ok(Some(Vec::new())),
+            ..Default::default()
+        };
         let p = profile("if:wg0");
         let checks = run(
             &Config {
@@ -682,11 +886,209 @@ mod tests {
             },
             "x",
             &p,
-            &NoBin,
+            &sys,
         );
         assert!(checks.iter().any(|c| c.name == "provider/selected"
             && c.status == Status::Fail
-            && c.detail.contains("#2")));
+            && c.detail.contains("#2")
+            && c.detail.contains("setup")));
+    }
+
+    #[test]
+    fn manifest_missing_fails_with_setup_hint() {
+        let sys = FakeSys {
+            manifest: Ok(None),
+            ..Default::default()
+        };
+        let p = profile("if:wg0");
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &sys,
+        );
+        assert!(checks.iter().any(|c| c.name == "manifest/state" && c.status == Status::Fail));
+        assert!(checks.iter().any(|c| c.name == "provider/selected" && c.status == Status::Fail));
+    }
+
+    #[test]
+    fn provider_version_drift_warns() {
+        let sys = FakeSys {
+            manifest: Ok(Some(vec![mentry("pasta", "/usr/bin/fake", Some("0.0.9-drift"))])),
+            ..Default::default()
+        };
+        let p = profile("if:wg0");
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &sys,
+        );
+        let c = checks
+            .iter()
+            .find(|c| c.name == "provider/selected")
+            .expect("provider/selected 存在");
+        assert_eq!(c.status, Status::Warn, "{}", c.detail);
+        assert!(c.detail.contains("版本漂移"), "{}", c.detail);
+        assert!(!any_fail(&checks));
+    }
+
+    #[test]
+    fn stale_entry_warns_with_prune_hint() {
+        let mut m = default_manifest();
+        m.push(mentry("gone:/tmp", "/tmp", None));
+        let sys = FakeSys {
+            manifest: Ok(Some(m)),
+            ..Default::default()
+        };
+        let p = profile("if:wg0");
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &sys,
+        );
+        let c = checks
+            .iter()
+            .find(|c| c.name == "manifest/stale")
+            .expect("manifest/stale 存在");
+        assert_eq!(c.status, Status::Warn, "{}", c.detail);
+        assert!(c.detail.contains("gone:/tmp"), "{}", c.detail);
+        assert!(c.detail.contains("gc --prune"), "{}", c.detail);
+        assert!(!any_fail(&checks));
+    }
+
+    #[test]
+    fn vanished_mountpoint_entry_fails() {
+        let mut m = default_manifest();
+        m.push(mentry("web:/nonexistent/mp", "/nonexistent/mp", None));
+        let sys = FakeSys {
+            manifest: Ok(Some(m)),
+            ..Default::default()
+        };
+        let p = profile("if:wg0");
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &sys,
+        );
+        let c = checks
+            .iter()
+            .find(|c| c.name == "manifest/mountpoints")
+            .expect("manifest/mountpoints 存在");
+        assert_eq!(c.status, Status::Fail, "{}", c.detail);
+        assert!(c.detail.contains("web:/nonexistent/mp"), "{}", c.detail);
+    }
+
+    #[test]
+    fn unregistered_missing_redirect_fails() {
+        let p: Profile =
+            toml::from_str("egress = 'if:wg0'\nredirect = ['/tmp/src-x=/nonexistent/dst-x']").unwrap();
+        let sys = FakeSys {
+            manifest: Ok(Some(Vec::new())),
+            ..Default::default()
+        };
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &sys,
+        );
+        let c = checks
+            .iter()
+            .find(|c| c.name == "manifest/redirect-registered")
+            .expect("manifest/redirect-registered 存在");
+        assert_eq!(c.status, Status::Fail, "{}", c.detail);
+        assert!(c.detail.contains("/nonexistent/dst-x"), "{}", c.detail);
+    }
+
+    #[test]
+    fn registered_existing_redirect_is_ok() {
+        // 已登记且在位 → Ok（setup 收敛后的稳态）
+        let mut m = default_manifest();
+        m.push(mentry("x:/registered/dst", "/registered/dst", None));
+        let sys = FakeSys {
+            manifest: Ok(Some(m)),
+            ..Default::default()
+        };
+        let p: Profile =
+            toml::from_str("egress = 'if:wg0'\nredirect = ['/tmp/src-x=/registered/dst']").unwrap();
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &sys,
+        );
+        let c = checks
+            .iter()
+            .find(|c| c.name == "manifest/redirect-registered")
+            .expect("manifest/redirect-registered 存在");
+        assert_eq!(c.status, Status::Ok, "{}", c.detail);
+    }
+
+    #[test]
+    fn manifest_state_corrupt_fails() {
+        let sys = FakeSys {
+            manifest: Err("schema = 99 不支持".into()),
+            ..Default::default()
+        };
+        let p = profile("if:wg0");
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &sys,
+        );
+        assert!(checks.iter().any(|c| c.name == "manifest/state" && c.status == Status::Fail));
+        assert!(checks.iter().any(|c| c.name == "provider/selected" && c.status == Status::Fail));
+    }
+
+    #[test]
+    fn dead_pinned_provider_path_fails() {
+        // 钉定路径可执行位缺失 = Fail（#2 清单态）
+        let sys = FakeSys {
+            exec_ok: false,
+            manifest: Ok(Some(vec![mentry("pasta", "/nonexistent/bin/pasta", Some("1.0.0"))])),
+            ..Default::default()
+        };
+        let p = profile("if:wg0");
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &sys,
+        );
+        let c = checks
+            .iter()
+            .find(|c| c.name == "provider/selected")
+            .expect("provider/selected 存在");
+        assert_eq!(c.status, Status::Fail, "{}", c.detail);
+        assert!(c.detail.contains("不可执行"), "{}", c.detail);
     }
 
     #[test]

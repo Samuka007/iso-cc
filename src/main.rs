@@ -1,12 +1,15 @@
 mod config;
 mod doctor;
+mod gc;
 mod list;
+mod manifest;
 mod netcfg;
 mod ns;
 mod plan;
 mod probe;
 mod provider;
 mod session;
+mod setup;
 
 use anyhow::{bail, Context as _};
 use clap::{Parser, Subcommand};
@@ -53,6 +56,33 @@ enum Commands {
         /// 机器可读输出
         #[arg(long)]
         json: bool,
+    },
+    /// 收敛 setup-manifested 资源并登记清单（幂等；重跑 action diff = 0）
+    Setup {
+        /// Profile 名（唯一 profile 时可省略）
+        #[arg(long)]
+        profile: Option<String>,
+        /// 机器可读输出
+        #[arg(long)]
+        json: bool,
+    },
+    /// 清单回收：默认 sweep 报告；--prune 清 stale 登记；--all 全量回收（终态清单与现实一致）
+    Gc {
+        /// 清 stale 条目（仅登记簿）
+        #[arg(long)]
+        prune: bool,
+        /// Profile 名（profile-state 仅随显式 --profile 回收）
+        #[arg(long)]
+        profile: Option<String>,
+        /// 全量回收（有活跃会话拒绝；provider 二进制永不删除，只除名）
+        #[arg(long)]
+        all: bool,
+        /// 越过 mountpoint 用户数据化守卫（显式放弃守卫数据）
+        #[arg(long)]
+        force: bool,
+        /// 跳过确认提示
+        #[arg(long)]
+        yes: bool,
     },
     /// 列出存活会话
     List {
@@ -118,6 +148,20 @@ fn run() -> anyhow::Result<()> {
             config,
             json,
         }) => cmd_doctor(config, profile, json),
+        Some(Commands::Setup { profile, json }) => cmd_setup(profile, json),
+        Some(Commands::Gc {
+            prune,
+            profile,
+            all,
+            force,
+            yes,
+        }) => cmd_gc(gc::GcOpts {
+            prune,
+            all,
+            yes,
+            force,
+            profile,
+        }),
         Some(Commands::List { json, .. }) => cmd_list(json),
         Some(Commands::Verify { profile, config }) => cmd_verify(profile, config),
         Some(Commands::ProbeJson { expect_tz }) => {
@@ -241,4 +285,21 @@ fn cmd_list(json: bool) -> anyhow::Result<()> {
         print!("{}", list::render_human(&sessions));
     }
     Ok(())
+}
+
+fn cmd_setup(profile: Option<String>, json: bool) -> anyhow::Result<()> {
+    let (cfg, warnings) = load_config(None)?;
+    for w in &warnings {
+        eprintln!("note: {w}");
+    }
+    let (name, prof) = resolve(&cfg, &profile)?;
+    setup::run(&name, &prof, json)
+}
+
+fn cmd_gc(opts: gc::GcOpts) -> anyhow::Result<()> {
+    let (cfg, warnings) = load_config(None)?;
+    for w in &warnings {
+        eprintln!("note: {w}");
+    }
+    gc::run(&opts, &cfg.profile)
 }

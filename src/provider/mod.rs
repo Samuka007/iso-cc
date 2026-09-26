@@ -6,7 +6,8 @@ pub mod slirp;
 
 use crate::config::NetGateway;
 use anyhow::{anyhow, bail, Context};
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 /// pasta `-I` 目标 ns 内 tap 名（issue 10 §Answer 硬规则：恒显式指定，
 /// 绝不回落「默认取 outbound 接口名」的命名规则）。
@@ -19,13 +20,64 @@ pub(crate) fn which(bin: &str) -> Option<PathBuf> {
         .find(|cand| cand.is_file())
 }
 
-/// fail-loud #2（09 期过渡态）：所选 gateway 的可执行 which 解析，缺失显式报错。
-/// 清单化定位（绝对路径 + 版本钉定）归票 14。
+/// provider `--version` 输出（trim 后；setup 登记 / doctor 漂移比对的版本事实源）。
+pub(crate) fn version_output(bin: &Path) -> anyhow::Result<String> {
+    let out = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("执行 {} --version", bin.display()))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "{} --version 失败（exit {:?}）",
+            bin.display(),
+            out.status.code()
+        );
+    }
+    // 版本钉定取首个非空行（pasta 的 license 尾块是常量噪声；构建事实变化仍会漂移）
+    let v = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    if v.is_empty() {
+        anyhow::bail!("{} --version 无 stdout（版本事实缺失，fail-loud）", bin.display());
+    }
+    Ok(v)
+}
+
+/// fail-loud #2（票 14 清单态，替换 09 期过渡态 which 解析）：所选 gateway 的可执行
+/// 从清单钉定（绝对路径 + 版本登记）。清单缺失 / 条目缺失 / 路径不可执行 = Fail，
+/// 提示 setup；run/doctor 的会话上树一律消费钉定路径（稀疏 PATH 生效的前提）。
 pub fn gateway_bin(gateway: NetGateway) -> anyhow::Result<PathBuf> {
     let name = gateway.bin_name();
-    which(name).ok_or_else(|| {
-        anyhow!("net.gateway={gateway}：{name} 不在 PATH（fail-loud #2；先运行 `iso-cc doctor` 检查 provider）")
-    })
+    let manifest = crate::manifest::read().map_err(|e| {
+        anyhow!("清单不可读（fail-loud #2）：{e}；修复或删除 {} 后重跑 `iso-cc setup`",
+            crate::manifest::manifest_path().display())
+    })?;
+    let Some(m) = manifest else {
+        anyhow::bail!(
+            "清单缺失（fail-loud #2）：net.gateway={gateway} 绝对路径未钉定——先运行 `iso-cc setup`"
+        )
+    };
+    let entry = m.find(crate::manifest::EntryKind::Provider, name).ok_or_else(|| {
+        anyhow!(
+            "清单无 {name} 条目（fail-loud #2）：net.gateway={gateway} 未登记——先运行 `iso-cc setup --profile <n>`"
+        )
+    })?;
+    let path = entry.path.clone().ok_or_else(|| {
+        anyhow!("清单 {name} 条目缺 path（清单损坏）——重跑 `iso-cc setup` 收敛")
+    })?;
+    let executable = std::fs::metadata(&path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false);
+    if !executable {
+        anyhow::bail!(
+            "provider 钉定路径不可执行：{}（fail-loud #2）——重跑 `iso-cc setup` 收敛",
+            path.display()
+        );
+    }
+    Ok(path)
 }
 
 /// fail-loud #12：`-I` 撞名断言——outbound 名与目标 ns 既有接口撞名类直接拒绝。

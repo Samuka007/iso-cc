@@ -47,26 +47,9 @@ pub struct Session {
 
 // ===== 生命周期三层防线（票 13；设计稿 design-session-lanes §4）=====
 //
-// unsafe 纪律：PR_SET_CHILD_SUBREAPER / kill(2) / waitpid(2) 三个生命周期内核原语
-// 在此以 libc 裸调用 + SAFETY 注释落地（票 13 契约文件集不含 ns.rs 与 Cargo.toml，
-// nix "signal" feature 不可引入）；每个 unsafe 块只包单次 syscall。
-
-/// L2 执行者（设计稿 §4-L2）：iso-cc 自设 PR_SET_CHILD_SUBREAPER(1)——会话树中任何
-/// 进程的父链断掉时 reparent 到 iso-cc 而非 init，[`Session::wait`] 的收编循环得以
-/// 直杀（CompScan #6：subreaper 与 PDEATHSIG 是配套机制；轮子盘点：内核原语，
-/// 拒绝 systemd-run --scope 与第三方看护 crate）。
-fn set_child_subreaper() -> anyhow::Result<()> {
-    // SAFETY: prctl(2) 单参数变体，作用于 iso-cc 主进程自身，无 fork/exec 上下文
-    // 前置条件；失败仅 EINVAL（参数非法，此处不可能）。
-    let rc = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
-    if rc != 0 {
-        return Err(anyhow!(
-            "PR_SET_CHILD_SUBREAPER 失败: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
-}
+// 纪律（票 14 归位）：PR_SET_CHILD_SUBREAPER / kill(2) / waitpid(2) 三个生命周期
+// 内核原语的安全薄封装在 ns.rs（全 crate 唯一非安全面）；本模块策略层（KillGuard /
+// 收编循环）只做编排，本文件词法无任何非安全块。
 
 /// spawn 后 `?` 早退路径的泄漏面兜底（audit-facts §3/§6「spawn 错误路径孤儿」）：
 /// arm 到 disarm 之间任何 `?` 早退，Drop 侧 SIGKILL + waitpid 收尸。
@@ -88,11 +71,11 @@ impl KillGuard {
 impl Drop for KillGuard {
     fn drop(&mut self) {
         let Some(pid) = self.pid.take() else { return };
-        // SAFETY: kill(2)/waitpid(2) 作用于本进程刚 spawn 的直接子女（spawn 返回值到
-        // Session 构造之间的窗口）；SIGKILL 不可捕获，waitpid 收尸防僵尸。子进程已自行
-        // 退出并被 try_wait reap → kill 得 ESRCH、waitpid 得 ECHILD，均忽略。
-        let killed = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } == 0;
-        unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) };
+        // 原语 = ns.rs 安全薄封装；作用于本进程刚 spawn 的直接子女（spawn 返回值到
+        // Session 构造之间的窗口）；SIGKILL 不可捕获，waitpid 收尸防僵尸。子进程已
+        // 自行退出并被 try_wait reap → kill 得 ESRCH、waitpid 得 ECHILD，均忽略。
+        let killed = ns::kill_pid(pid, libc::SIGKILL);
+        ns::reap_waitpid(pid);
         if killed {
             eprintln!("[iso-cc] KillGuard: spawn 错误路径击杀泄漏子进程 pid={pid}");
         }
@@ -113,8 +96,9 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
     provider::validate_egress_iface(&egress_iface)?;
     // fail-loud #3：宿主 egress 接口存在且 UP（sysfs，spawn 前断言；R8 绝不回落）
     provider::host_iface_up(&egress_iface)?;
-    // L2（设计稿 §4-L2）：会话树建立前自设 subreaper——收编循环的 reparent 前提。
-    set_child_subreaper()?;
+    // L2（设计稿 §4-L2）：会话树建立前自设 subreaper——收编循环的 reparent 前提
+    // （原语 = ns::set_child_subreaper，票 14 归位）。
+    ns::set_child_subreaper().map_err(|e| anyhow!("PR_SET_CHILD_SUBREAPER 失败: {e}"))?;
 
     let gateway = profile.gateway();
     let dns = profile.dns();
@@ -146,29 +130,25 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
     // DNS：net.dns（默认 10.0.2.3）= pasta --dns-forward 地址 = slirp 内建转发器同址
     std::fs::write(&resolv, format!("nameserver {dns}\n"))?;
     binds.push((resolv, "/etc/resolv.conf".to_string()));
+    // locale binds（sess_dir 资产 → /etc/*）：dst 缺失则跳过该 bind（R2 视线主 =
+    // TZ env；宿主无 /etc/localtime 时即此路径，历史行为保持）。
+    binds.retain(|(_, dst)| Path::new(dst).exists());
+
+    // redirect 挂载点 = setup-manifested（票 14 清单态，spec 变更（一）：会话过程
+    // 零持久物）：run 零预创建，缺失 = fail-loud 提示 setup 收敛并登记。
+    let mut redirect_binds: Vec<(PathBuf, String)> = Vec::new();
     for r in &profile.redirect {
         let (src, dst) = r
             .split_once('=')
             .ok_or_else(|| anyhow!("redirect 必须是 `src=dst`：{r:?}"))?;
-        binds.push((PathBuf::from(src), dst.to_string()));
-    }
-    // 挂载点缺失预创建：宿主侧以真实 uid 执行（子进程 uid 未映射时 O_CREAT 会 EACCES）。
-    // 残留 = N3 有界例外（doctor 报告；setup-manifested 迁移归 14）。
-    binds.retain(|(_, dst)| {
         if !Path::new(dst).exists() {
-            match std::fs::write(dst, b"") {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!(
-                        "[iso-cc] note: 挂载点 {dst} 缺失且不可预创建（{e}）——跳过该 bind（TZ env 已覆盖主要视线）"
-                    );
-                    false
-                }
-            }
-        } else {
-            true
+            bail!(
+                "挂载点 {dst} 缺失（fail-loud：run 零预创建，setup-manifested 归 setup）——先运行 `iso-cc setup` 收敛并登记"
+            );
         }
-    });
+        redirect_binds.push((PathBuf::from(src), dst.to_string()));
+    }
+    binds.extend(redirect_binds);
 
     // bootstrap plan（§1.4）：mode 位承载 provider 差异（§1.2 被否双模式并存的收敛点）
     let plan = BootstrapPlan {
@@ -468,13 +448,11 @@ impl Session {
             for pid in list::children_of(self_pid) {
                 match list::proc_marker(pid) {
                     Some(id) => {
-                        // SAFETY: kill(2)/waitpid(2)；pid = reparent 到本进程的收养子女
+                        // 原语 = ns.rs 安全薄封装；pid = reparent 到本进程的收养子女
                         // （subreaper 语义，waitpid 合法）。已死未收尸者 kill 得 ESRCH、
                         // waitpid 直接收尸；存活者 SIGKILL 不可捕获，阻塞收尸。
-                        unsafe {
-                            libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                            libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
-                        }
+                        ns::kill_pid(pid, libc::SIGKILL);
+                        ns::reap_waitpid(pid);
                         eprintln!(
                             "[iso-cc] L2 收编: 孤儿 pid={pid}（ISO_CC_SESSION={id}）→ SIGKILL + reaped"
                         );

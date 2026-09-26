@@ -1,4 +1,5 @@
-//! ns.rs —— 会话 namespace 装配原语（票 11；设计稿 design-session-lanes §2）。
+//! ns.rs —— 会话 namespace 装配原语（票 11；设计稿 design-session-lanes §2）
+//! + 生命周期原语（票 14 归位：PR_SET_CHILD_SUBREAPER / kill / waitpid，§4-L2）。
 //!
 //! 全 crate 唯一 unsafe 面：每个 unsafe fn 的前置条件写成 SAFETY 注释并由入口保证
 //! （§2.2）；错误一律 `last_os_error`，无文案（原语层，§2.1）。binds 的 CString 在
@@ -238,4 +239,45 @@ pub fn cstring_binds(binds: &[(String, String)]) -> io::Result<Vec<(CString, CSt
             ))
         })
         .collect()
+}
+
+// ===== 生命周期原语（票 13 期落 session.rs → 票 14 归位本模块；设计稿 §4-L2）=====
+//
+// 会话 crate 的 unsafe 面收敛纪律（§2.1）延伸到生命周期内核原语：PR_SET_CHILD_SUBREAPER /
+// kill(2) / waitpid(2) 在此以 libc 裸调用 + SAFETY 注释落地为安全薄封装，session.rs 恢复
+// unsafe=0 不变量（票 14 spec #6）。每个 unsafe 块只包单次 syscall。
+
+/// L2 执行者（设计稿 §4-L2）：iso-cc 自设 PR_SET_CHILD_SUBREAPER(1)——会话树中任何
+/// 进程的父链断掉时 reparent 到 iso-cc 而非 init，收编循环得以直杀收养子女
+/// （轮子盘点：内核原语，拒绝 systemd-run --scope 与第三方看护 crate）。
+pub fn set_child_subreaper() -> io::Result<()> {
+    // SAFETY: prctl(2) 单参数变体，作用于 iso-cc 主进程自身，无 fork/exec 上下文
+    // 前置条件；失败仅 EINVAL（参数非法，此处不可能）。
+    let rc = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// kill(2) 薄封装；false = 失败（ESRCH/EPERM 等，调用方决定是否上报）。
+///
+/// # SAFETY
+///
+/// kill(2) AS-safe；`pid` 语义由调用方保证（本进程子女 / subreaper 收养子女 /
+/// L3 sweep 判定的孤儿网关）。
+pub fn kill_pid(pid: u32, sig: libc::c_int) -> bool {
+    // SAFETY: kill(2)；见上
+    unsafe { libc::kill(pid as libc::pid_t, sig) == 0 }
+}
+
+/// waitpid(2) 收尸（阻塞）；ECHILD/EINVAL 静默（调用点均为「刚 SIGKILL 后收尸」或
+/// 「已自行退出被 reap」双态）。
+///
+/// # SAFETY
+///
+/// waitpid(2)；`pid` = 本进程子女或 subreaper 语义下 reparent 到本进程的收养子女。
+pub fn reap_waitpid(pid: u32) {
+    // SAFETY: waitpid(2)；见上
+    unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) };
 }

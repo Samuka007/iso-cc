@@ -21,8 +21,6 @@ nix = { version = "0.31.3", default-features = false, features = ["sched", "moun
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.21"
+tempfile = "3.27.0"
 toml = "1.1.6"
 tzdb = "0.7.3"
-
-[dev-dependencies]
-tempfile = "3.27.0"
