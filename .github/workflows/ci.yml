@@ -1,0 +1,17 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v16
+      - name: checks (clippy, fmt, nextest)
+        run: nix build -L .#checks.x86_64-linux.clippy .#checks.x86_64-linux.fmt .#checks.x86_64-linux.nextest
+      - name: build
+        run: nix build -L .#packages.x86_64-linux.default
