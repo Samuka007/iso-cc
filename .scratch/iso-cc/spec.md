@@ -1,6 +1,6 @@
 # iso-cc Spec（v1）
 
-> 正本来源：docs/REQUIREMENTS.md（R1–R12/N1–N6/D1–D8）+ docs/research/ 5 份研究。本文件是 agent 可执行的收敛版；冲突时以 REQUIREMENTS 为准。
+> 正本来源：docs/REQUIREMENTS.md（R1–R12/N1–N6/D1–D8）+ ../iso-cc-research/ 5 份研究。本文件是 agent 可执行的收敛版；冲突时以 REQUIREMENTS 为准。
 
 ## Problem Statement
 
@@ -40,7 +40,7 @@ rootless 轻量会话：userns+mountns+netns + 用户态网关（pasta）钉死�
 ## Testing Decisions
 
 - 唯一高层测试缝：`iso-cc` CLI（`run --print-plan` / `doctor` / `verify` / `list`）。探针实现与其共享（verify = 产品化的测试矩阵）。
-- 探针 P1–P15 + P3b（纯净度）、R12 子矩阵 12 条（浏览器，P3）、工具面 P16–P27（MCP/hooks/IDE/OTel）——见 docs/research/ 三份研究。
+- 探针 P1–P15 + P3b（纯净度）、R12 子矩阵 12 条（浏览器，P3）、工具面 P16–P27（MCP/hooks/IDE/OTel）——见 ../iso-cc-research/ 三份研究。
 - 状态不变式：宿主 diff（mountinfo/route/ruleset/lsns/~/.claude*）为零（有界例外登记）。
 - 引擎无关：探针不感知 engine=netns|mark。
 

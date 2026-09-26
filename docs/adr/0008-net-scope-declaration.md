@@ -58,4 +58,4 @@ shim 实现采用 **multi-call 模式**：bind 上去的就是 iso-cc 自身（a
 
 ## 附 3：二进制取证修正（claude-code 2.1.263，2026-09-26）
 
-cc 实测主路径确认为 L1（读 `process.env.SHELL`，fallback `SHELL||COMSPEC||...`，二进制含 `/bin/bash`、`/usr/bin/bash` 字面量兜底 → L3 补齐）。**但**：Hooks、REPL `!cmd`、skill `!cmd`、statusline 全部硬编码 `/bin/sh -c`，不走 `$SHELL`——L1/L2/L3（针对 bash 的）不覆盖这些面，self 范围下它们留 netns 直跑。官方 `CLAUDE_CODE_SHELL_PREFIX` env（实测覆盖 Bash 工具/hooks/statusline/stdio MCP）是更完备的拦截层候选——登记为 L1.5，实现时优先验证。D8 例外表需显式声明：hooks/statusline/REPL 面 + WebSearch（服务端执行，无客户端网络）+ WebFetch（cc 进程 fetch，拒绝 localhost + api.anthropic.com preflight）。详见 docs/research/2026-09-26-cc-tool-surface.md。
+cc 实测主路径确认为 L1（读 `process.env.SHELL`，fallback `SHELL||COMSPEC||...`，二进制含 `/bin/bash`、`/usr/bin/bash` 字面量兜底 → L3 补齐）。**但**：Hooks、REPL `!cmd`、skill `!cmd`、statusline 全部硬编码 `/bin/sh -c`，不走 `$SHELL`——L1/L2/L3（针对 bash 的）不覆盖这些面，self 范围下它们留 netns 直跑。官方 `CLAUDE_CODE_SHELL_PREFIX` env（实测覆盖 Bash 工具/hooks/statusline/stdio MCP）是更完备的拦截层候选——登记为 L1.5，实现时优先验证。D8 例外表需显式声明：hooks/statusline/REPL 面 + WebSearch（服务端执行，无客户端网络）+ WebFetch（cc 进程 fetch，拒绝 localhost + api.anthropic.com preflight）。详见 ../iso-cc-research/2026-09-26-cc-tool-surface.md。
