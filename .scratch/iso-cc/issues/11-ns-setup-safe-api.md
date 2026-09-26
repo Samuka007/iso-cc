@@ -1,26 +1,38 @@
-# 11 — 会话 ns 安装收敛为具名安全 API（去脚本式 unsafe 内联）
+# 11 — ns.rs 安全 API：双入口（mountns / selfmap），session.rs unsafe 归零
 
-**What to build:** `session.rs` pre_exec 里 50+ 行 unsafe 闭包（unshare/mount/bind/remount/pdeathsig + `ck!` 宏内联）重构为最小 unsafe 面 + 具名安全 API。评审定性（用户 0927-1）：脚本思维——一段过程式 sh 脚本被直译成 Rust，unsafe 边界、错误处理、步骤语义全部糊在一个闭包里。
+**What to build:** 按设计稿 §2 落地（正本 = `../design-session-lanes.md` §2.1/§2.2/§2.3/§8-11 行；更早的票面设想被 §2.3 取代）。
 
-**Blocked by:** 09 A1（同文件手术，串行）　**Owner:** 待派（session.rs lane 序贯）
+**Blocked by:** 09（已完成）　**Owner:** lane-ns-safe-api（完成）
+**Status:** done（2026-09-26，parent 亲验通过）
+
+## Answer（PM 落）
+
+- grep 实测：session.rs unsafe = 0；src/ 全域 unsafe 仅 ns.rs（26 处 SAFETY 注释）
+- nix 0.31.3（resolver 定版，--no-default-features --features sched,mount）
+- parent 复跑：pasta `run -- true` rc=0；`exit 7`→7（pasta）、`exit 5`→5（slirp selfmap 路径）；nextest 25/25；clippy 干净；零残留
+- 三处偏离（合理，SAFETY 锚明）：①`ns::install_pre_exec`——CommandExt::pre_exec 本体 unsafe，安装面收敛进 ns.rs 才能词法归零；②`write_self_ugid_map(uid,gid)` 带参——unshare 后 getuid() 呈 overflow uid 65534，首轮 strace 抓到 EPERM 后修正（与 09 parent 侧捕获值等价）；③`set_pdeathsig_verified` safe fn，expected_ppid=0 = 结构对账（getppid()==1 自尽）
 
 ## Specification
 
-1. 新模块 `src/ns.rs`：`pub fn enter_session_ns(binds: &[(PathBuf, PathBuf)], ipv6_off: bool) -> io::Result<()>` 为唯一对外入口；session.rs 的 pre_exec 只调它，不含任何 unsafe
-2. 内部拆小、单一职责、各带 SAFETY 注释（不变量：仅 fork 后单线程 pre_exec 期调用；错误 = `last_os_error` 传播）：
-   - `unshare_session_ns()` — CLONE_NEWUSER|NEWNS|NEWNET
-   - `make_root_private()` — `/` MS_REC|MS_PRIVATE
-   - `bind_ro(src, dst)` — bind + remount RDONLY（含 CString 转换错误归一为 io::Error）
-   - `set_pdeathsig(SIGKILL)`
-   - ipv6 关闭：随 12 落地 /proc/sys 直写后归入 12 的模块（本票先保持调用点收敛）
-3. 禁止"把 unsafe 搬个位置"：每个 unsafe fn 的前置条件必须写成注释并被入口函数保证
+1. 新模块 `src/ns.rs`，双入口：
+   - `enter_mountns(binds: &[(CString, CString)], expected_ppid: u32) -> io::Result<()>`（pasta spawn primary 路径：仅 CLONE_NEWNS + rprivate + bind_ro + PDEATHSIG 对账）
+   - `enter_selfmap_ns(binds, expected_ppid)`（slirp 专用：CLONE_NEWUSER|NEWNS|NEWNET + pre_exec 内自写 setgroups/uid_map/gid_map 单条自映射，user_namespaces(7) 规则序）
+   - 内部 unsafe fn 逐个具名（unshare_mountns / make_root_private / bind_ro / set_pdeathsig_verified / unshare_user_net_mountns / write_self_ugid_map），SAFETY 注释按设计稿 §2.2 草案落地
+2. **CString 父进程预转换**，pre_exec 闭包只持转换结果（信号安全）
+3. PDEATHSIG 对账：prctl 后 getppid 对账 expected_ppid，不符自尽（kill self）——竞态清单见 man PR_SET_PDEATHSIG
+4. session.rs 的 pre_exec 闭包改为对 ns.rs 的单调用；session.rs 内 unsafe 归零
 
 ## Acceptance
 
-- [ ] session.rs 内 unsafe 块归零；全部收敛在 ns.rs 且每个 unsafe fn 有 SAFETY 注释
-- [ ] 行为等价：现有探针套件与单测不改断言照绿（P6/P6c bind 路径不变）
-- [ ] `cargo clippy --all-targets -- -D warnings` 绿；`cargo nextest run` 全绿
+- [ ] grep 证 session.rs 无 unsafe；全部 unsafe 收敛在 ns.rs 且每个 unsafe fn 有 SAFETY 注释
+- [ ] 行为等价：nextest 全绿（探针断言不改）；`run -- true`（pasta 路径）+ slirp 路径端到端 rc=0；`exit 7` → 7 仍透传
+- [ ] clippy -D warnings 绿
+- [ ] 冒烟（设计稿 §8-11 行）：双路径各跑一次端到端
+
+## 轮子盘点
+
+crate 线 `nix::sched::unshare` / `nix::mount::mount`（或 rustix，cargo add 定版）；拒绝 unshare(1)/mount(8) CLI（execve 纪律 + pre_exec 装配序不可承载）；拒绝 `unshare` crate（0.7.0 @2021 死亡）。
 
 ## 边界
 
-- 不改 `.scratch/**`、`docs/**`；不 git commit；不趁便做 12 的 netlink 改造（串行票）
+- 不改 `.scratch/**`、`docs/**`；不 git；不动 12/13/14/15 范围；一次验证收尾

@@ -1,28 +1,14 @@
 use crate::config::{NetGateway, NetIpv6, Profile};
+use crate::ns;
 use crate::provider;
 use anyhow::{anyhow, bail, Context};
 use serde::{Deserialize, Serialize};
-use std::ffi::{CString, OsString};
-use std::io;
+use std::ffi::OsString;
 use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-
-const CLONE_NEWNS: libc::c_int = 0x0002_0000;
-const CLONE_NEWNET: libc::c_int = 0x4000_0000;
-const CLONE_NEWUSER: libc::c_int = 0x1000_0000;
-
-/// syscall 返回值检查：非 0 即 last_os_error（原语层错误约定，无文案）。
-/// 过渡形态：11 按 §2.2 抽出 ns.rs 双入口后随 unsafe 面一起收敛。
-macro_rules! ck {
-    ($e:expr) => {
-        if ($e) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    };
-}
 
 /// bootstrap plan（设计稿 §1.4 参数面）：同二进制 serde 往返 + `deny_unknown_fields`
 /// （#5 fail-loud）；argv 传递 = 子进程交接零状态（无临时文件）。
@@ -214,18 +200,11 @@ fn spawn_pasta(
     gw.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    // PDEATHSIG→iso-cc + 精确对账（PR_SET_PDEATHSIG(2const) 竞态②，ns.rs §4-L1）
     let expected_ppid = std::process::id();
-    unsafe {
-        gw.pre_exec(move || {
-            ck!(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL));
-            // PR_SET_PDEATHSIG(2const) 竞态②：prctl 时父已死则不发信号——对账失败自尽
-            if libc::getppid() as u32 != expected_ppid {
-                libc::kill(libc::getpid(), libc::SIGKILL);
-                return Err(io::Error::other("pdeathsig 对账失败（父进程已死）"));
-            }
-            Ok(())
-        });
-    }
+    ns::install_pre_exec(&mut gw, move || {
+        ns::set_pdeathsig_verified(libc::SIGKILL, expected_ppid)
+    });
     let mut pasta = gw
         .spawn()
         .with_context(|| format!("spawn pasta（{}）", pasta_bin.display()))?;
@@ -280,42 +259,10 @@ fn spawn_slirp(
     }
     apply_env(&mut bs, profile);
 
-    // pre_exec 自映射（§1.3 下树）。CString 全部父进程预转换，闭包内零分配（§2.1 纪律）。
-    let binds: Vec<(CString, CString)> = plan
-        .binds
-        .iter()
-        .map(|(s, d)| -> anyhow::Result<(CString, CString)> {
-            Ok((
-                CString::new(s.as_str()).map_err(|_| anyhow!("bind src 含 NUL：{s:?}"))?,
-                CString::new(d.as_str()).map_err(|_| anyhow!("bind dst 含 NUL：{d:?}"))?,
-            ))
-        })
-        .collect::<anyhow::Result<_>>()
-        .context("bind 路径预转换")?;
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-    let deny = CString::new("deny").expect("无 NUL");
-    let uid_map = CString::new(format!("0 {uid} 1\n")).expect("无 NUL");
-    let gid_map = CString::new(format!("0 {gid} 1\n")).expect("无 NUL");
+    // pre_exec 自映射（§1.3 下树）：binds 父进程预转换（§2.1），闭包体 = ns.rs 入口 B 单调用
+    let binds = ns::cstring_binds(&plan.binds).context("bind 路径预转换")?;
     let expected_ppid = std::process::id();
-    unsafe {
-        bs.pre_exec(move || {
-            ck!(libc::unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWNET));
-            // PDEATHSIG→iso-cc + 精确对账（expected ppid 已知：iso-cc 直接 spawn）
-            ck!(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL));
-            if libc::getppid() as u32 != expected_ppid {
-                libc::kill(libc::getpid(), libc::SIGKILL);
-                return Err(io::Error::other("pdeathsig 对账失败（父进程已死）"));
-            }
-            // 自写单条 maps（user_namespaces(7) 规则：先 setgroups=deny 再 uid/gid 各一行
-            // "0 <own> 1"；open/write/close AS-safe；先于 mount——caps 依赖 userns root）
-            write_self_map(c"/proc/self/setgroups", &deny)?;
-            write_self_map(c"/proc/self/uid_map", &uid_map)?;
-            write_self_map(c"/proc/self/gid_map", &gid_map)?;
-            mount_private_and_binds(&binds)?;
-            Ok(())
-        });
-    }
+    ns::install_pre_exec(&mut bs, move || ns::enter_selfmap_ns(&binds, expected_ppid));
     let root = bs
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -352,60 +299,6 @@ fn spawn_slirp(
     })
 }
 
-/// /proc/self/{setgroups,uid_map,gid_map} 直写：open/write/close 均 AS-safe（man 约定）；
-/// 循环写完全部字节（proc 写允许部分写）。11 抽 ns.rs::write_self_ugid_map 时随迁。
-unsafe fn write_self_map(path: &std::ffi::CStr, data: &std::ffi::CStr) -> io::Result<()> {
-    let fd = libc::open(path.as_ptr(), libc::O_WRONLY);
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let bytes = data.to_bytes();
-    let mut off = 0usize;
-    while off < bytes.len() {
-        let n = libc::write(
-            fd,
-            bytes.as_ptr().add(off) as *const libc::c_void,
-            bytes.len() - off,
-        );
-        if n < 0 {
-            libc::close(fd);
-            return Err(io::Error::last_os_error());
-        }
-        off += n as usize;
-    }
-    libc::close(fd);
-    Ok(())
-}
-
-/// `/` rprivate 化 + 只读 bind 串。输入必须预转换 CString（pre_exec 闭包内零分配）。
-/// SAFETY: 仅 fork 后 exec 前（单线程）或 bootstrap 单线程早期调用；
-/// mount(2) 作用于本 mountns，MS_REC|MS_PRIVATE 不产生宿主可见变化（mountns 私有）。
-unsafe fn mount_private_and_binds(binds: &[(CString, CString)]) -> io::Result<()> {
-    ck!(libc::mount(
-        std::ptr::null(),
-        c"/".as_ptr(),
-        std::ptr::null(),
-        libc::MS_REC | libc::MS_PRIVATE,
-        std::ptr::null()
-    ));
-    for (src, dst) in binds {
-        ck!(libc::mount(
-            src.as_ptr(),
-            dst.as_ptr(),
-            std::ptr::null(),
-            libc::MS_BIND,
-            std::ptr::null()
-        ));
-        ck!(libc::mount(
-            std::ptr::null(),
-            dst.as_ptr(),
-            std::ptr::null(),
-            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
-            std::ptr::null()
-        ));
-    }
-    Ok(())
-}
 
 /// session-bootstrap 主体（§1.4 新参面）：plan 解析（#5 fail-loud）→ 自设会话标记
 /// → 按模式进 ns（mountns：pasta 之下由本进程自建；selfmap：父侧 pre_exec 已完成）
@@ -433,35 +326,9 @@ pub fn bootstrap_run(
 /// PDEATHSIG→pasta + 结构对账：spawn 模式父=pasta、pid 不可预知，父死则被 reparent 到
 /// pid 1 → 自尽；prctl 之后 pasta 死亡由内核信号覆盖。
 fn enter_mountns_inband(plan: &BootstrapPlan) -> anyhow::Result<()> {
-    unsafe {
-        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-            bail!("prctl(PR_SET_PDEATHSIG): {}", io::Error::last_os_error());
-        }
-        if libc::getppid() == 1 {
-            libc::kill(libc::getpid(), libc::SIGKILL);
-            bail!("pdeathsig 对账失败：父进程（pasta）已死，已被 reparent 到 init");
-        }
-        if libc::unshare(CLONE_NEWNS) != 0 {
-            bail!("unshare(CLONE_NEWNS): {}", io::Error::last_os_error());
-        }
-    }
-    let binds: Vec<(CString, CString)> = plan
-        .binds
-        .iter()
-        .map(|(s, d)| -> anyhow::Result<(CString, CString)> {
-            Ok((
-                CString::new(s.as_str()).map_err(|_| anyhow!("bind src 含 NUL：{s:?}"))?,
-                CString::new(d.as_str()).map_err(|_| anyhow!("bind dst 含 NUL：{d:?}"))?,
-            ))
-        })
-        .collect::<anyhow::Result<_>>()
-        .context("bind 路径预转换")?;
-    // SAFETY: bootstrap 单线程早期；已处于 pasta 建立的 userns/netns（§2.2 入口 A 前置）
-    unsafe {
-        mount_private_and_binds(&binds)
-            .map_err(|e| anyhow!("mountns 装配（rprivate/bind_ro）失败: {e}"))?;
-    }
-    Ok(())
+    let binds = ns::cstring_binds(&plan.binds).context("bind 路径预转换")?;
+    // expected_ppid=0 = 结构对账（pasta 路径父 pid 不可预知，ns.rs 入口 A）
+    ns::enter_mountns(&binds, 0).map_err(|e| anyhow!("mountns 装配（pasta 之下）失败: {e}"))
 }
 
 /// 等网关 tap 就绪（provider 无关）→ exec 真实命令。
