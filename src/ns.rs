@@ -281,3 +281,38 @@ pub fn reap_waitpid(pid: u32) {
     // SAFETY: waitpid(2)；见上
     unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) };
 }
+
+// ===== exec RPC 通道原语（票 15；SCM_RIGHTS 接收方的 fd 所有权收编）=====
+
+/// RawFd → OwnedFd（取得所有权，RAII close）。SCM_RIGHTS 接收方语义：内核已把 fd
+/// dup 到本进程，接收方负责 close——std 无 `From<RawFd> for OwnedFd`（safe 面缺口），
+/// 唯一 unsafe 面纪律（§2.1）下收编为本模块具名原语。
+///
+/// # SAFETY
+///
+/// `raw` 必须是本进程已拥有的有效 fd（SCM_RIGHTS 接收 / pipe / dup 的返回值），
+/// 不得为借用语义的外部 fd（如 0/1/2 或他人仍持有的 fd）——包装后由 OwnedFd 的
+/// drop 负责 close，双重所有权 = use-after-close。`from_raw_fd` 仅转移所有权。
+pub fn own_scm_rights_fd(raw: std::os::fd::RawFd) -> std::os::fd::OwnedFd {
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: 见上；调用方（execrpc::recv_request）以 SCM_RIGHTS 接收结果为唯一入参源。
+    unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }
+}
+
+/// pre_exec 期 stdio 接管（票 15 exec worker）：依次把 `[stdin, stdout, stderr]`
+/// 三个已拥有 fd dup2 到 0/1/2。nix 0.31 的 dup2 系封装受 "fs" feature 门控且
+/// 形态（&mut OwnedFd 目标）不合 pre_exec——按 §2.1 原语纪律落 libc 裸调用。
+///
+/// # SAFETY
+///
+/// dup2(2) AS-safe；`src` 各项须为本进程有效 fd（SCM_RIGHTS 接收面，所有权随
+/// 调用方闭包存活至 exec）。单线程 pre_exec 上下文由 install_pre_exec 保证。
+pub fn adopt_stdio(src: &[std::os::fd::RawFd; 3]) -> std::io::Result<()> {
+    for (i, &fd) in src.iter().enumerate() {
+        // SAFETY: dup2(2)；fd 有效性由上方约定保证，-1 即 last_os_error。
+        if unsafe { libc::dup2(fd, i as libc::c_int) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}

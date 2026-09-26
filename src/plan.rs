@@ -1,4 +1,4 @@
-use crate::config::{NetGateway, NetIpv6, NetPrivate, NetScope, Profile};
+use crate::config::{ExecBash, NetGateway, NetIpv6, NetPrivate, Profile};
 use crate::provider;
 use std::ffi::{OsStr, OsString};
 
@@ -10,8 +10,9 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
     let gateway = p.gateway();
     let dns = p.dns();
     v.push(format!(
-        "plan[profile={profile_name} scope={:?} ipv6={:?} private={:?} gateway={gateway} dns={dns}]",
+        "plan[profile={profile_name} scope={:?} exec.bash={:?} ipv6={:?} private={:?} gateway={gateway} dns={dns}]",
         p.scope(),
+        p.exec_bash(),
         p.ipv6(),
         p.net.private.unwrap_or(NetPrivate::Tunnel)
     ));
@@ -77,16 +78,37 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
     for (k, val) in &p.env {
         v.push(format!("9. env {k}={val:?}"));
     }
-    match p.scope() {
-        NetScope::Self_ => {
+    // 票 15（spec 变更（四））：两轴独立声明，--print-plan 展开全部组合
+    v.push(format!(
+        "10a. net.scope={:?}: identity scope（tree=整树入 netns 一致性 US2；self=cc 本体面收窄，verify 探针恒测 cc 本体）",
+        p.scope()
+    ));
+    match p.exec_bash() {
+        ExecBash::Sandbox => {
             v.push(
-                "10. scope=self: bash -c 走 exec.sock RPC 到宿主 netns 执行（T2 后接入）".into(),
+                "10b. exec.bash=sandbox: bash 工具留在会话内执行（继承 netns；行为与现状等价）"
+                    .into(),
             );
         }
-        NetScope::Tree => {
-            v.push("10. scope=tree: bash 留在 netns 内执行".into());
+        ExecBash::Host => {
+            v.push(
+                "10b. exec.bash=host: bash 调用经 <sessions/<id>/exec.sock> RPC 宿主侧 /bin/bash -c 执行（US9 真 localhost；bash 流量走宿主出口 = 显式声明的代价）".into(),
+            );
+            v.push(
+                "10b1. 拦截分层注入: L1.5 CLAUDE_CODE_SHELL_PREFIX + L1 SHELL + L2 PATH 前置 <sessions/<id>/bin> → multi-call shim（iso-cc 自身，argv0 basename=bash）"
+                    .into(),
+            );
+            v.push(
+                "10b2. 覆盖面（ADR 0008 附 3 取证 + 通道实测）: Bash 工具/hooks/statusline/stdio MCP 经 L1.5 宿主执行；REPL !cmd 与 skill !cmd 硬编码 /bin/sh——L1/L2 不覆盖、L1.5 prefix 覆盖；WebSearch/WebFetch 无客户端 bash 面；完全 in-process 执行器无钩点（诚实边界）"
+                    .into(),
+            );
         }
     }
+    v.push(format!(
+        "10c. combo: net.scope={:?} + exec.bash={:?}",
+        p.scope(),
+        p.exec_bash()
+    ));
     match command {
         Some(c) => v.push(format!(
             "11. exec {} (env: TZ/LANG/CLAUDE 重定向已生效)",
@@ -161,10 +183,51 @@ mod tests {
         let p = prof("egress = 'if:wg0'\nnet.scope = 'self'");
         let lines = plan_lines("x", &p, Some(&OsString::from("claude")));
         assert!(
-            lines.iter().any(|l| l.contains("exec.sock RPC")),
+            lines.iter().any(|l| l.contains("net.scope=Self")),
             "{lines:?}"
         );
         assert!(lines.iter().any(|l| l.contains("exec claude")));
+    }
+
+    #[test]
+    fn exec_bash_host_plan_declares_channel_and_layers() {
+        let p = prof("egress = 'if:wg0'\nexec.bash = 'host'");
+        let lines = plan_lines("x", &p, Some(&OsString::from("claude")));
+        let joined = lines.join("\n");
+        assert!(joined.contains("exec.bash=Host"), "{joined}");
+        assert!(joined.contains("exec.sock"), "{joined}");
+        assert!(joined.contains("L1.5 CLAUDE_CODE_SHELL_PREFIX"), "{joined}");
+        assert!(joined.contains("multi-call shim"), "{joined}");
+        // 两轴独立：scope 默认 tree 与 host 组合可见（变更（四）四组合之 tree+host）
+        assert!(joined.contains("net.scope=Tree"), "{joined}");
+        assert!(joined.contains("combo: net.scope=Tree + exec.bash=Host"), "{joined}");
+    }
+
+    #[test]
+    fn plan_expands_all_four_combos() {
+        for (scope, bash, combo) in [
+            ("tree", "sandbox", "combo: net.scope=Tree + exec.bash=Sandbox"),
+            ("tree", "host", "combo: net.scope=Tree + exec.bash=Host"),
+            ("self", "host", "combo: net.scope=Self_ + exec.bash=Host"),
+            ("self", "sandbox", "combo: net.scope=Self_ + exec.bash=Sandbox"),
+        ] {
+            let p = prof(&format!("egress = 'if:wg0'\nnet.scope = '{scope}'\nexec.bash = '{bash}'"));
+            let lines = plan_lines("x", &p, None);
+            assert!(
+                lines.iter().any(|l| l.contains(combo)),
+                "{scope}+{bash} 组合未展开: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_default_plan_states_equivalence() {
+        let p = prof("egress = 'if:wg0'");
+        let lines = plan_lines("x", &p, None);
+        let joined = lines.join("\n");
+        assert!(joined.contains("exec.bash=Sandbox"), "{joined}");
+        assert!(joined.contains("行为与现状等价"), "{joined}");
+        assert!(!joined.contains("exec.sock"), "sandbox 不得出现 exec.sock 通道面: {joined}");
     }
 
     #[test]

@@ -1,4 +1,5 @@
-use crate::config::{NetGateway, NetIpv6, Profile};
+use crate::config::{ExecBash, NetGateway, NetIpv6, Profile};
+use crate::execrpc;
 use crate::list;
 use crate::netcfg;
 use crate::ns;
@@ -43,6 +44,8 @@ pub struct Session {
     pub gateway: Option<Child>,
     /// 会话资产目录（正常退出后回收；残留交 doctor sweep 上报）。
     pub sess_dir: PathBuf,
+    /// exec RPC 通道（仅 `exec.bash=host`，票 15）；wait 收尾时 shutdown。
+    pub exec_server: Option<execrpc::ExecServer>,
 }
 
 // ===== 生命周期三层防线（票 13；设计稿 design-session-lanes §4）=====
@@ -150,6 +153,18 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
     }
     binds.extend(redirect_binds);
 
+    // exec RPC 通道（票 15 spec#1）：exec.bash=host 时装配（bin/bash shim 符号链接 +
+    // exec.sock bind+0600）。fallible 须在网关 spawn 前——env 注入需要通道路径。
+    // 网关二进制解析（fail-loud #2 清单门）须先于通道 prepare：prepare 落盘
+    // sock/shim，若其后才因清单缺失 bail，会把会话资产留成 residue（21:01 冒烟实测）。
+    let gateway_bin = provider::gateway_bin(gateway)?;
+    // exec RPC 通道（票 15 spec#1）：exec.bash=host 时装配（bin/bash shim 符号链接 +
+    // exec.sock bind+0600）。fallible 须在网关 spawn 前——env 注入需要通道路径。
+    let exec_channel = match profile.exec_bash() {
+        ExecBash::Host => Some(execrpc::prepare(&sess_dir, profile, &session_id)?),
+        ExecBash::Sandbox => None,
+    };
+
     // bootstrap plan（§1.4）：mode 位承载 provider 差异（§1.2 被否双模式并存的收敛点）
     let plan = BootstrapPlan {
         mode: match gateway {
@@ -182,32 +197,43 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
         }
     };
 
+    // spawn 上下文（票 15 收敛参数面：exec 通道加入后 spawn_pasta 触 clippy 8 参上限）
+    let ctx = SpawnCtx {
+        session_id: &session_id,
+        sess_dir: &sess_dir,
+        plan: &plan,
+        gateway_bin,
+        exec: exec_channel,
+    };
     match gateway {
-        NetGateway::Pasta => spawn_pasta(
-            profile,
-            &session_id,
-            &sess_dir,
-            &egress_iface,
-            dns,
-            &plan,
-            inner,
-        ),
-        NetGateway::Slirp4netns => spawn_slirp(profile, &session_id, &sess_dir, &plan, inner),
+        NetGateway::Pasta => spawn_pasta(ctx, profile, &egress_iface, dns, inner),
+        NetGateway::Slirp4netns => spawn_slirp(ctx, profile, inner),
     }
+}
+
+/// spawn 期共享上下文：会话标识/资产目录/bootstrap plan/exec 通道（票 15）。
+struct SpawnCtx<'a> {
+    session_id: &'a str,
+    sess_dir: &'a Path,
+    plan: &'a BootstrapPlan,
+    gateway_bin: PathBuf,
+    exec: Option<execrpc::ExecChannel>,
 }
 
 /// gateway=pasta（primary，设计稿 §1.3 上树）：pasta 即会话根，bootstrap 由 pasta 在
 /// userns/netns 内拉起。R8 由内核结构性执行：pasta 死 → bootstrap/cc 经 PDEATHSIG 链即灭。
 fn spawn_pasta(
+    mut ctx: SpawnCtx<'_>,
     profile: &Profile,
-    session_id: &str,
-    sess_dir: &Path,
     egress_iface: &str,
     dns: Ipv4Addr,
-    plan: &BootstrapPlan,
     inner: Vec<OsString>,
 ) -> anyhow::Result<Session> {
-    let pasta_bin = provider::gateway_bin(NetGateway::Pasta)?;
+    let session_id = ctx.session_id;
+    let sess_dir = ctx.sess_dir;
+    let plan = ctx.plan;
+    let exec = &mut ctx.exec;
+    let pasta_bin = &ctx.gateway_bin;
     let plan_json = serde_json::to_string(plan).context("序列化 bootstrap plan")?;
     let mut bs_args: Vec<OsString> = vec![
         std::env::current_exe()
@@ -223,7 +249,7 @@ fn spawn_pasta(
     bs_args.extend(inner);
 
     let log_file = sess_dir.join("gateway.log");
-    let mut gw = Command::new(&pasta_bin);
+    let mut gw = Command::new(pasta_bin);
     for a in provider::pasta::flag_args(egress_iface, dns, log_file.as_os_str()) {
         gw.arg(a);
     }
@@ -233,8 +259,9 @@ fn spawn_pasta(
     }
     // 双标记之一：pasta 自身带 ISO_CC_SESSION（list/sweep 对网关的识别键，§4-L3）
     gw.env("ISO_CC_SESSION", session_id);
-    // TZ/LANG/env 与 CLAUDE_CONFIG_DIR 摘除经 pasta env 链传至 bootstrap/cc
-    apply_env(&mut gw, profile);
+    // TZ/LANG/env 与 CLAUDE_CONFIG_DIR 摘除经 pasta env 链传至 bootstrap/cc；
+    // exec.bash=host 时叠加拦截分层注入（L1.5/L1/L2 + ISO_CC_EXEC_SOCK，票 15）
+    apply_env(&mut gw, profile, exec.as_ref());
     // pasta 自身诊断 → -l gateway.log（#4 tail 取证）；stdio 全 inherit：
     // child 与 pasta 共享 stdio（本机取证），probe JSON / cc 交互不得被日志劫持
     gw.stdin(Stdio::inherit())
@@ -267,29 +294,32 @@ fn spawn_pasta(
     }
 
     eprintln!(
-        "[iso-cc] session {session_id}: root=pasta(pid={}) egress-iface={egress_iface} dns={dns} scope={:?} assets={}",
+        "[iso-cc] session {session_id}: root=pasta(pid={}) egress-iface={egress_iface} dns={dns} scope={:?} exec.bash={:?} assets={}",
         pasta.id(),
         profile.scope(),
+        profile.exec_bash(),
         sess_dir.display()
     );
     guard.disarm();
+    // serve 启动点（启动不失败）：置于最后可失败操作之后，KillGuard 面（spawn 后
+    // `?` 早退）不扩大。
+    let exec_server = exec.take().map(execrpc::ExecChannel::serve);
     Ok(Session {
         root: pasta,
         gateway: None,
         sess_dir: sess_dir.to_path_buf(),
+        exec_server,
     })
 }
 
 /// gateway=slirp4netns（回退，设计稿 §1.3 下树）：bootstrap 自映射进三 ns（selfmap，
 /// 父侧 pre_exec），slirp4netns attach；parent 永不写 /proc/<pid>/maps（Facts §3 残留源消灭）。
-fn spawn_slirp(
-    profile: &Profile,
-    session_id: &str,
-    sess_dir: &Path,
-    plan: &BootstrapPlan,
-    inner: Vec<OsString>,
-) -> anyhow::Result<Session> {
-    let slirp_bin = provider::gateway_bin(NetGateway::Slirp4netns)?;
+fn spawn_slirp(mut ctx: SpawnCtx<'_>, profile: &Profile, inner: Vec<OsString>) -> anyhow::Result<Session> {
+    let session_id = ctx.session_id;
+    let sess_dir = ctx.sess_dir;
+    let plan = ctx.plan;
+    let exec = &mut ctx.exec;
+    let slirp_bin = &ctx.gateway_bin;
     let plan_json = serde_json::to_string(plan).context("序列化 bootstrap plan")?;
     let mut bs = Command::new(std::env::current_exe().expect("current_exe 不可用"));
     bs.arg("session-bootstrap")
@@ -301,7 +331,7 @@ fn spawn_slirp(
     for a in &inner {
         bs.arg(a);
     }
-    apply_env(&mut bs, profile);
+    apply_env(&mut bs, profile, exec.as_ref());
 
     // pre_exec 自映射（§1.3 下树）：binds 父进程预转换（§2.1），闭包体 = ns.rs 入口 B 单调用
     let binds = ns::cstring_binds(&plan.binds).context("bind 路径预转换")?;
@@ -321,7 +351,7 @@ fn spawn_slirp(
     let log_file = sess_dir.join("gateway.log");
     let log =
         std::fs::File::create(&log_file).with_context(|| format!("创建 {}", log_file.display()))?;
-    let mut gw = Command::new(&slirp_bin);
+    let mut gw = Command::new(slirp_bin);
     for a in provider::slirp::attach_args(root.id()) {
         gw.arg(a);
     }
@@ -335,18 +365,21 @@ fn spawn_slirp(
     let gw_guard = KillGuard::arm(gateway.id());
 
     eprintln!(
-        "[iso-cc] session {session_id}: root=bootstrap(pid={}) gateway=slirp4netns(pid={}, attach) scope={:?} assets={}",
+        "[iso-cc] session {session_id}: root=bootstrap(pid={}) gateway=slirp4netns(pid={}, attach) scope={:?} exec.bash={:?} assets={}",
         root.id(),
         gateway.id(),
         profile.scope(),
+        profile.exec_bash(),
         sess_dir.display()
     );
     root_guard.disarm();
     gw_guard.disarm();
+    let exec_server = exec.take().map(execrpc::ExecChannel::serve);
     Ok(Session {
         root,
         gateway: Some(gateway),
         sess_dir: sess_dir.to_path_buf(),
+        exec_server,
     })
 }
 
@@ -422,6 +455,12 @@ impl Session {
                 let _ = gw.wait();
             }
         }
+        // exec RPC 收尾（票 15 spec#4）：先停通道 + kill 在途 worker（后台任务存续至
+        // 会话结束），再进 L2 收编——worker 的后台子进程（已 reparent、带标记）由收编
+        // 循环收割。
+        if let Some(s) = self.exec_server.take() {
+            s.shutdown();
+        }
         // L2 收编循环（设计稿 §4-L2）：PDEATHSIG fork 即清、孙进程不在 L1 覆盖面
         // （audit-facts §6），setsid 逃逸者经 subreaper reparent 到本进程，此处直杀。
         self.reap_adopted();
@@ -460,7 +499,7 @@ impl Session {
                     }
                     None => {
                         eprintln!(
-                            "[iso-cc] L2 登记: 收养孤儿 pid={pid} 无 ISO_CC_SESSION 标记——不杀（host 执行语义预留，票 15）；无标记即 doctor sweep 域外"
+                            "[iso-cc] L2 登记: 收养孤儿 pid={pid} 无 ISO_CC_SESSION 标记——不杀；宿主侧 exec worker（票 15）带标记走 marked 支，本支仅域外孤儿"
                         );
                     }
                 }
@@ -487,7 +526,10 @@ fn session_dir(session_id: &str) -> anyhow::Result<PathBuf> {
 /// TZ/LANG/显式 env 与 CLAUDE_CONFIG_DIR 摘除。调用对象 = 会话 env 的传播点：
 /// pasta（spawn 模式，经 env 链传至 bootstrap/cc）或 bootstrap（slirp 模式）。
 /// ISO_CC_SESSION 双标记不在此：pasta/slirp 由 Command::env 注入，bootstrap 自设（§1.4）。
-fn apply_env(cmd: &mut Command, profile: &Profile) {
+/// `exec=Some`（exec.bash=host，票 15）叠加拦截分层注入：L1.5 `CLAUDE_CODE_SHELL_PREFIX`
+/// （附 3 取证覆盖 Bash 工具/hooks/statusline/stdio MCP）+ L1 `SHELL`（fallback 面）+
+/// L2 PATH 前置 shim 目录 + `ISO_CC_EXEC_SOCK` 通道指针。
+fn apply_env(cmd: &mut Command, profile: &Profile, exec: Option<&execrpc::ExecChannel>) {
     if let Some(tz) = &profile.locale.tz {
         cmd.env("TZ", tz);
     }
@@ -500,6 +542,19 @@ fn apply_env(cmd: &mut Command, profile: &Profile) {
     }
     // 防宿主 CLAUDE_CONFIG_DIR 泄漏进会话（R4）
     cmd.env_remove("CLAUDE_CONFIG_DIR");
+    if let Some(ch) = exec {
+        cmd.env("CLAUDE_CODE_SHELL_PREFIX", &ch.shell_path);
+        cmd.env("SHELL", &ch.shell_path);
+        cmd.env("ISO_CC_EXEC_SOCK", &ch.sock_path);
+        // L2：PATH 前置 shim 目录（目录内仅 `bash` 一键；宿主 worker PATH = 宿主基底，
+        // 不受此影响——env 策略 server 侧，execrpc::worker_env_vars）。
+        if let Some(p) = std::env::var_os("PATH") {
+            let mut new_path = OsString::from(ch.bin_dir.as_os_str());
+            new_path.push(":");
+            new_path.push(&p);
+            cmd.env("PATH", new_path);
+        }
+    }
 }
 
 /// gateway.log 末尾 max 行（#4 tail 取证）。

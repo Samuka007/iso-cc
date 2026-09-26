@@ -17,10 +17,11 @@ libc = "0.2.189"
 netlink-packet-core = "0.9"
 netlink-packet-route = "0.33"
 netlink-sys = { version = "0.9", default-features = false }
-nix = { version = "0.31.3", default-features = false, features = ["sched", "mount"] }
+nix = { version = "0.31.3", default-features = false, features = ["sched", "mount", "socket"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.21"
 tempfile = "3.27.0"
 toml = "1.1.6"
 tzdb = "0.7.3"
+parking_lot = "0.12"

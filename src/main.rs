@@ -1,5 +1,7 @@
 mod config;
 mod doctor;
+mod execrpc;
+mod execstub;
 mod gc;
 mod list;
 mod manifest;
@@ -119,6 +121,11 @@ enum Commands {
 }
 
 fn main() {
+    // multi-call stub 分派（票 15 / ADR 0008 附 2）：argv0 basename == "bash" = 转发
+    // 模式（L1 SHELL / L1.5 prefix / L2 PATH shim 三种调用形态共用同一入口；不返回）。
+    if execstub::is_stub_invocation(std::env::args_os().next().as_deref()) {
+        execstub::forward();
+    }
     if let Err(e) = run() {
         eprintln!("error: {e:#}");
         std::process::exit(1);

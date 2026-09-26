@@ -2,7 +2,16 @@
 
 **What to build:** 按设计稿 §3 落地（正本 = `../design-session-lanes.md` §3.1/§3.2/§5/§8-12 行；本票早期设想已被 §3.1 前提修正取代）。
 
-**Blocked by:** 11（已完成）　**Owner:** 待派
+**Blocked by:** 11（已完成）　**Owner:** lane-netcfg-deshell（完成）
+**Status:** done（2026-09-26，parent 亲验通过）
+
+## Answer（PM 落）
+
+- parent 复跑：session.rs `sh/sh_ok/"ip"/"sysctl"` = 0；strace execve 集（pasta 路径）grep ip/sysctl = 0；nextest 27/27（+2 netcfg 单测）；clippy 干净
+- crate：netlink-sys 0.9.0（sync，no-default-features）+ netlink-packet-route 0.33.0
+- A2 PATH 最小化的诚实偏差：字面 `PATH=/usr/bin:/bin` 在 NixOS 触发 fail-loud #2（pasta 在 /nix/store）= 设计 §8-12 清单钉路径前提（归 14）；等价证明 = 稀疏 PATH + provider store 目录、故意排除 ip/sysctl 所在 current-system/sw/bin（`command -v ip sysctl` rc=1）双 provider rc=0
+- 契约备注：main.rs +`mod netcfg;` 一行（机械必需，已通告）；host_iface_up 复用于 provider/mod.rs（票面允许）
+- 遗留一行：plan.rs:69 陈旧文案（"direct-write lands with issue 12"）→ 归 13 票面顺带修
 
 ## Specification（前提修正后）
 

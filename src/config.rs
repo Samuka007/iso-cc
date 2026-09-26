@@ -53,6 +53,9 @@ pub struct Profile {
     pub locale: Locale,
     #[serde(default)]
     pub net: Net,
+    /// bash 执行位置轴（票 15 / spec 变更（四））：与 net.scope 正交的独立声明面。
+    #[serde(default)]
+    pub exec: Exec,
     #[serde(default)]
     pub agent: Agent,
     /// 额外声明式路径重定向（R4 机制扩展），格式 `src=dst`。
@@ -61,6 +64,23 @@ pub struct Profile {
     /// 额外注入 env（如 HISTFILE），opt-in。
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+}
+
+/// `exec.bash` 声明（票 15）：`sandbox`（默认，bash 工具会话内执行，行为与现状等价）
+/// | `host`（经 exec.sock RPC 通道宿主侧执行，US9 真 localhost；身份一致性让位 =
+/// 显式声明的代价，spec 变更（四））。
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecBash {
+    Sandbox,
+    Host,
+}
+
+/// `[exec]` 声明节（票 15 两轴解耦的第二轴）。未知键 = 配置错误（deny_unknown_fields）。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Exec {
+    pub bash: Option<ExecBash>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -135,6 +155,11 @@ impl Profile {
     /// 生效 scope（未声明 = tree）。
     pub fn scope(&self) -> NetScope {
         self.net.scope.unwrap_or(NetScope::Tree)
+    }
+
+    /// 生效 bash 执行位置（未声明 = sandbox，行为与现状等价）。
+    pub fn exec_bash(&self) -> ExecBash {
+        self.exec.bash.unwrap_or(ExecBash::Sandbox)
     }
 
     /// 生效 IPv6 策略（未声明 = off，fail-closed）。
@@ -361,6 +386,53 @@ agent.command = "claude"
         )
         .expect_err("未知 gateway 取值必须 fail-loud（#1）");
         assert!(err.to_string().contains("unknown variant"), "{err}");
+    }
+
+    #[test]
+    fn exec_bash_axis_independent_of_net_scope() {
+        // 两轴独立声明（spec 变更（四））：任一组合都必须可解析，互不牵连。
+        for (scope, bash) in [
+            ("tree", "sandbox"),
+            ("tree", "host"),
+            ("self", "host"),
+            ("self", "sandbox"),
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                "version = 1\n[profile.x]\negress = 'if:wg0'\nnet.scope = '{scope}'\nexec.bash = '{bash}'"
+            ))
+            .unwrap();
+            let p = cfg.profile.get("x").unwrap();
+            assert_eq!(p.exec_bash(), if bash == "host" { ExecBash::Host } else { ExecBash::Sandbox }, "{scope}+{bash}");
+            assert_eq!(
+                p.scope(),
+                if scope == "self" { NetScope::Self_ } else { NetScope::Tree },
+                "{scope}+{bash}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_bash_defaults_to_sandbox() {
+        let cfg: Config = toml::from_str("version = 1\n[profile.x]\negress = 'if:wg0'").unwrap();
+        assert_eq!(cfg.profile.get("x").unwrap().exec_bash(), ExecBash::Sandbox);
+    }
+
+    #[test]
+    fn unknown_exec_bash_value_rejected() {
+        let err = toml::from_str::<Config>(
+            "version = 1\n[profile.x]\negress = 'if:wg0'\nexec.bash = 'remote'",
+        )
+        .expect_err("未知 exec.bash 取值必须 fail-loud（#1）");
+        assert!(err.to_string().contains("unknown variant"), "{err}");
+    }
+
+    #[test]
+    fn unknown_exec_field_rejected() {
+        let err = toml::from_str::<Config>(
+            "version = 1\n[profile.x]\negress = 'if:wg0'\nexec.mode = 'host'",
+        )
+        .expect_err("exec 节未知键必须 fail-loud");
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     #[test]
