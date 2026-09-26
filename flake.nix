@@ -65,7 +65,7 @@
           inputsFrom = [ iso-cc ];
 
           packages = with pkgs; [
-            pasta
+            passt
             slirp4netns
             curl
             jq
