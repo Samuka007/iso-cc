@@ -1,35 +1,32 @@
 # iso-cc 票索引（PM 维护；票面 Answer 由 PM 独家更新）
 
-正本口令原则：票/spec = 正本；消息只携带票指针 + 执行所有权。spec：`../spec.md`（含变更记录一/二/三/四）。设计稿：`../design-session-lanes.md`（已返回）。
+正本口令原则：票/spec = 正本；消息只携带票指针 + 执行所有权。spec：`../spec.md`（变更记录一/二/三/四）。设计稿：`../design-session-lanes.md`。审计材料：`../audit-code-facts.md`。
 
-| 票 | 状态 | Owner | 阻塞 |
-|---|---|---|---|
-| 01 project-skeleton | done | — | — |
-| 02 config+doctor | done（本机绿） | — | — |
-| 03 minimal-session | done（2026-09-26 本机验收） | — | — |
-| 04 network-egress | 重排：由 09/12 吸收（pasta primary / 就绪等待） | — | 09, 12 |
-| 05 cc-profile-isolation | ready | — | 03 |
-| 06 verify-matrix | in-progress（v0.2 子集本机绿） | — | — |
-| 07 slirp4netns-fallback | 吸收进 09（slirp = provider#2，selfmap 入口 + `-c`） | — | 09 |
-| 08 release | ready | — | 全部 |
-| 09 provider-pasta-primary | ready（票面按设计稿 §1/§5 修正后开工；首个冒烟 = pasta 退出码透传取证） | 待派 | 设计稿已落盘 |
-| 10 pasta-attach-tunsetiff | done（2026-09-26，works；`-I` 硬规则） | — | — |
-| 11 ns-setup-safe-api | ready（scope 按设计稿 §2：双入口 mountns/selfmap） | 待派 | 09 |
-| 12 no-shell-netlink-failloud | ready（scope 修正：两 provider self-config → 只剩就绪等待 + /proc/sys 直写） | 待派 | 11 |
-| 13 lifecycle-three-layer-kill | ready（audit-code-facts §6 五缺口：PDEATHSIG 对账、subreaper 收编、killpg、daemon 孙、网关标记 env） | 待派 | 12 |
-| 14 setup-gc-manifest | ready（两级清单：manifest/setup/doctor 双向/gc；nix profile 同构先例） | 待派 | 13 |
-| 15 bash-stub-exec-rpc | ready（spec 变更（四）；机制正本 ADR 0008 附/附2/附3；L1.5 优先验证） | 待派 | 13 |
+## Phase I 完成态（2026-09-26，HEAD 5ff406a）
 
-## Phase D 裁决（2026-09-26 完成）
+| 票 | 状态 | 亲验证据锚 |
+|---|---|---|
+| 09 provider-pasta-primary | done | root=pasta banner、exit7→7、print-plan `-I`、if:lo/nonexistent0 拒绝 |
+| 10 pasta-attach-tunsetiff | done | works（`-I` 硬规则，passt 命名默认坑） |
+| 11 ns-safe-api | done | session.rs unsafe=0（26 SAFETY 收敛 ns.rs）、双路径透传 |
+| 12 no-shell-netlink | done | strace execve 无 ip/sysctl、netlink 就绪等待、PATH 最小化双 provider |
+| 13 lifecycle-3layer | done | kill -9 pasta→树灭、收编日志、假孤儿→doctor FAIL |
+| 14 setup-gc-manifest | done | setup×2 diff=0、清单门拒未 setup profile、gc 终态一致、unsafe 归位 |
+| 15 bash-stub-exec-rpc | done | 判别亲验：host PID1=systemd 无 tap / sandbox PID1=bash 有 tap、rc=7 经通道 |
 
-1. **总裁决 = 薄编排成熟 CLI**：网络面零自研；自研收缩 = config/doctor/verify、就绪等待、进程树终止三层、清单/GC、locale 注入。无候选工具整体替代（对比表无一全绿）。
-2. D2/D4/D5/D7 维持且证据增强；D4 择型时 pasta+tun2proxy 与 embedded 并列实测。
-3. **设计稿裁决（design-session-lanes.md）= pasta spawn 转正**：R8 内核结构性执行（bootstrap PDEATHSIG 对账 pasta pid）、uid_map 竞态消灭、unsafe 面收缩（mountns 入口 + slirp 专用 selfmap 入口）、attach 模式降为 slirp 同构参考。
+## 剩余工作
 
-## Phase I 串行序
-
-**09 → 11 → 12 → 13 → 14 → 15**；每 lane parent 亲验后放行。设计稿 §8 有每 lane 触碰文件清单（无交叉证明）与冒烟命令。票面若与设计稿冲突，派发时以设计稿为准修正（12 配网命令删除已确认）。
+| 票 | 状态 | 说明 |
+|---|---|---|
+| 04 network-egress | done（由 09/12 吸收）| 宿主浏览器直开 dev server（--publish 面）与 net.localhost_forward 未做——待排新票 |
+| 05 cc-profile-isolation | ready | 下一主力票（R4/R5：redirect 集与 CC 状态重定向实测） |
+| 06 verify-matrix | in-progress | v0.2 子集绿（8 探针）；R12 子矩阵与 P16–P27 工具面待真实 cc 环境 |
+| 07 slirp4netns-fallback | done（吸收进 09 selfmap 入口） | 4090 全矩阵待跑 |
+| 08 release | ready | 全票合口后 |
+| D4 SOCKS 择型 | pending | pasta+tun2proxy vs embedded 自研并列实测（等 4090 隧道形态） |
+| engine=mark 变体 | pending（触发条件未触发） | exec.bash=host 已解 US9 主诉求；cc 直spawn 进程的透明 localhost 残余缺口观察中 |
 
 ## 事件簿
 
-- 2026-09-26 session.rs:218 单 token 损坏（某 lane 越界改仓库）；parent 从 HEAD 恢复，cargo check 绿。纪律：lane 不得改仓库文件（例外：lane 自己的 deliverable 文件，如 research/*.md、design-session-lanes.md）；发现损坏只报告不修复。
+- 2026-09-26 session.rs:218 单 token 损坏（lane 越界）；parent HEAD 恢复。
+- 2026-09-26 票 15 lane 越权写票面 Answer（55 行）；内容经 PM 亲验反签保留；违规记档。
