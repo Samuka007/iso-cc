@@ -1,26 +1,31 @@
-# 12 — 会话路径零外部命令：netlink 直配 + /proc/sys 直写 + fail-loud bootstrap
+# 12 — 零外部命令：netlink 就绪等待 + /proc/sys 直写 + fail-loud bootstrap
 
-**What to build:** 会话/引导路径废除对 `ip`（iproute2）与 `sysctl` 二进制的依赖，改为进程内原语；废除 `sh()` 吞错模式。评审定性（用户 0927-1）：脚本思维——用 sh+字符串参数编排网络，发行版无 iproute2 即哑掉（D5 的 distro-hopping/静态 musl 目标形态不允许）；且 `sh()` 不查退出码，配置失败静默继续到探针才红，违反 fail-loud。
+**What to build:** 按设计稿 §3 落地（正本 = `../design-session-lanes.md` §3.1/§3.2/§5/§8-12 行；本票早期设想已被 §3.1 前提修正取代）。
 
-**Blocked by:** 09 A1（session.rs 串行）；参考 10 结论（若 pasta `--config-net` 成立，pasta provider 的 guest 侧配网整体消失，netlink 仅服务 slirp provider 与等待逻辑）
-**Owner:** 待派（session.rs lane 序贯，在 11 之后）
+**Blocked by:** 11（已完成）　**Owner:** 待派
 
-## Specification
+## Specification（前提修正后）
 
-1. netlink 配网（`rtnetlink`/`netlink-packet-route`，版本 `cargo add` resolver 决定，禁手写；同步封装——bootstrap 是同步上下文）：
-   - `link_up(iface)`、`addr_add(iface, cidr)`、`default_route(via, dev)` 替代三条 `ip` 命令
-   - tap0 就绪等待（现 `ip link show` 轮询）改 netlink dump/事件
-2. `/proc/sys/net/ipv6/conf/{all,default}/disable_ipv6` 直写替代 `sysctl -w`（含写失败 fail-loud）
-3. bootstrap 全链路错误传播：任一步骤失败 → 带步骤名/接口/`io::Error` 上下文 bail；禁止 sleep-继续、禁止退出码不查
-4. provider trait 接口下：`tap_plan` 生成"等待+配置"计划，pasta（`--config-net`）= 仅等待，slirp = 等待+netlink 配置
+1. **配网命令已消失**（两 provider self-config：pasta `--config-net`；slirp `-c`）——bootstrap 不再有 ip addr/route 调用；本票删除残留的 `sh`/`sh_ok`（tap 轮询）并整体废除吞错模式
+2. `netcfg.rs`（新，无 unsafe，同步）：
+   - `wait_ready(iface, timeout) -> io::Result<()>`：**netlink dump**（tap 存在 + UP + 默认路由）fail-loud 超时（文案含 gateway.log 指针，修正 audit-facts §5 反例）。**09 取证：ns 内 /sys/class/net 呈宿主视图（sysfs netns-tag 伪影）——必须 netlink，勿用 sysfs**
+   - `disable_ipv6()`：`/proc/sys/net/ipv6/conf/{all,default}/disable_ipv6` 直写（bootstrap 期消费 plan.ipv6_off），fail-loud
+   - `host_iface_up(name)`：若 09 已实现则复用/迁移，不重复
+3. crate：netlink-sys 0.9 + netlink-packet-route 0.33（MIT，同步栈）或 neli 0.7.4（BSD）——cargo add resolver 定版
+4. 错误传播：任何 bootstrap 步骤失败 = 步骤名/接口/io::Error 上下文 bail
 
-## Acceptance
+## Acceptance（= 设计稿 §8-12 冒烟）
 
-- [ ] 会话/引导路径 execve 集合不含 `ip`/`sysctl`（验证：`strace -f -e trace=execve` 冒烟输出为证）
-- [ ] PATH 无 iproute2 的最小环境冒烟通过（`env PATH=/usr/bin:/bin` 或容器最小 shell）
-- [ ] 错误路径 fail-loud：单测覆盖 netlink 失败 → bootstrap 带上下文报错退出（不许静默）
-- [ ] clippy -D warnings 绿；nextest 全绿；探针行为不回归
+- [ ] `strace -f -e trace=execve` 全会话无 `ip`/`sysctl` execve（输出留 /tmp）
+- [ ] PATH 最小化冒烟：`env PATH=/usr/bin:/bin` 下双 provider 端到端 rc=0
+- [ ] 单测：wait_ready 喂超时 → 带上下文失败；disable_ipv6 写失败路径 fail-loud
+- [ ] `curl -6` 会话内必败（P2 复核，设计稿 §9.4 时序确认）；探针 8 项 6/1/1 不回归
+- [ ] clippy -D warnings 绿；nextest 全绿；`sh`/`sh_ok` 从 session.rs 消失
+
+## 轮子盘点
+
+netlink 原语 = 现成 crate（CompScan #6/#7：netlink-sys/netlink-packet-route/neli 全活跃）；无自研 netlink 解析。iproute2 不再被调用。
 
 ## 边界
 
-- 不改 `.scratch/**`、`docs/**`；不 git commit；11 未合入前不动 session.rs
+- 不改 `.scratch/**`、`docs/**`；不 git；不动 13/14/15 范围；一次验证收尾

@@ -14,6 +14,9 @@ strip = true
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 libc = "0.2.189"
+netlink-packet-core = "0.9"
+netlink-packet-route = "0.33"
+netlink-sys = { version = "0.9", default-features = false }
 nix = { version = "0.31.3", default-features = false, features = ["sched", "mount"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

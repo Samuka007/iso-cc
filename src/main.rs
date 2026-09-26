@@ -1,6 +1,7 @@
 mod config;
 mod doctor;
 mod list;
+mod netcfg;
 mod ns;
 mod plan;
 mod probe;

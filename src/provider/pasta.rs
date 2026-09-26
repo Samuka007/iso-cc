@@ -12,6 +12,9 @@ use std::net::Ipv4Addr;
 /// - `-I` 硬规则恒显式（issue 10 §Answer：默认命名取 outbound 接口名，必撞）。
 /// - `-l`：pasta 自身诊断入 gateway.log（#4 tail 取证），stdio 保持 inherit
 ///   ——child（bootstrap/cc）与 pasta 共享 stdio（本机取证），会话 I/O 不得被日志劫持。
+/// - 就绪 spec（票 12，§3.2）：`--config-net` self-config tap0（地址 + v4 默认路由），
+///   bootstrap 以 netlink dump 断言就绪（netcfg::wait_ready，provider 无关）；
+///   ready-fd 线被否——pasta 无 `-r`，引入即破坏 provider 无关性。
 pub fn flag_args(egress: &str, dns: Ipv4Addr, log_file: &OsStr) -> Vec<OsString> {
     vec![
         "-f".into(),

@@ -45,6 +45,8 @@ pub fn validate_egress_iface(name: &str) -> anyhow::Result<()> {
 
 /// fail-loud #3：宿主 egress 接口存在且 UP（sysfs `flags` 的 IFF_UP 位，spawn 前断言）。
 /// R8：绝不回落。用 IFF_UP（管理态）而非 operstate——WireGuard 类隧道接口恒报 unknown。
+/// 边界：sysfs 断言仅宿主侧合法；ns 内就绪断言走 [`crate::netcfg::wait_ready`]
+/// （netlink，provider 无关）——09 取证 #5：ns 内 /sys/class/net 呈宿主视图伪影。
 pub fn host_iface_up(name: &str) -> anyhow::Result<()> {
     let base = std::path::Path::new("/sys/class/net").join(name);
     if !base.exists() {

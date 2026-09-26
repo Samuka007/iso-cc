@@ -1,4 +1,5 @@
 use crate::config::{NetGateway, NetIpv6, Profile};
+use crate::netcfg;
 use crate::ns;
 use crate::provider;
 use anyhow::{anyhow, bail, Context};
@@ -334,6 +335,8 @@ fn enter_mountns_inband(plan: &BootstrapPlan) -> anyhow::Result<()> {
 /// 等网关 tap 就绪（provider 无关）→ exec 真实命令。
 /// 两 provider 均 self-config（pasta `--config-net` / slirp `-c`，§3.1）：
 /// 原 `ip addr add`/`ip route add`/`ip link set tap0 up` 配网命令整体删除。
+/// 票 12：ipv6_off → /proc/sys 直写（§3.3）→ netlink 就绪等待（§3.2）→ exec；
+/// 残留的吞错 shell 助手（lo up + tap 轮询）整体废除——bootstrap 期零 execve。
 fn bootstrap_exec(
     plan: &BootstrapPlan,
     session_id: &str,
@@ -346,21 +349,11 @@ fn bootstrap_exec(
     // 「pasta 自身故障」；会话资产，13 sweep 收敛）
     let marker = session_dir(session_id)?.join("bootstrapped");
     std::fs::write(&marker, b"").with_context(|| format!("写 exec 前标记 {}", marker.display()))?;
-    sh(&["ip", "link", "set", "lo", "up"]);
-    let deadline = std::time::Instant::now() + Duration::from_millis(plan.timeout_ms);
-    loop {
-        if sh_ok(&["ip", "link", "show", plan.iface.as_str()]) {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            bail!(
-                "等待 {} 超时（{}ms，网关未就绪；宿主侧 sessions/<id>/gateway.log 取证）",
-                plan.iface,
-                plan.timeout_ms
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    // §3.3 时机：v6 直写先于就绪等待；与 provider self-config 同 netns sysctl 并发无害。
+    if plan.ipv6_off {
+        netcfg::disable_ipv6()?;
     }
+    netcfg::wait_ready(&plan.iface, Duration::from_millis(plan.timeout_ms))?;
     let mut c = Command::new(prog);
     for a in &command[1..] {
         c.arg(a);
@@ -410,20 +403,6 @@ fn apply_env(cmd: &mut Command, profile: &Profile) {
     }
     // 防宿主 CLAUDE_CONFIG_DIR 泄漏进会话（R4）
     cmd.env_remove("CLAUDE_CONFIG_DIR");
-}
-
-fn sh(argv: &[&str]) {
-    let _ = Command::new(argv[0]).args(&argv[1..]).output();
-}
-
-fn sh_ok(argv: &[&str]) -> bool {
-    Command::new(argv[0])
-        .args(&argv[1..])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 /// gateway.log 末尾 max 行（#4 tail 取证）。
