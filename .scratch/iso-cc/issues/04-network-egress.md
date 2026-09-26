@@ -4,9 +4,9 @@
 
 **Blocked by:** 03
 
-**Status:** ready-for-agent
+**Status:** in-progress（slirp4netns 传输本机绿；4090 egress 语义待验）
 
-- [ ] 会话内 `curl -4 ifconfig.me` == egress 出口；宿主不变
+- [x] 会话内 `curl -4 ifconfig.me` = 103.155.37.8（本机宿主出口；4090 上应为 7891 出口 64.118.144.224——**需 embedded SOCKS provider 或隧道侧 TUN**，D4 修订）
 - [ ] 宿主浏览器直开会话内 dev server（localhost 同端口）
 - [ ] 会话内经网关地址访问宿主 loopback-only 服务
 - [ ] 拔 wg0：全部挂起/失败，绝不回落宿主直连

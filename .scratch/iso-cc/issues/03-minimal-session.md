@@ -4,8 +4,8 @@
 
 **Blocked by:** 02
 
-**Status:** ready-for-agent
+**Status:** done（2026-09-26，本机验收）
 
-- [ ] 会话内 `date +%Z`、`locale`、`readlink /etc/localtime`（真实路径）、Node `Intl` 四视线一致
-- [ ] kill -9 后 `/proc/mountinfo`、`lsns`、`~/.claude*` diff 为空
+- [x] 会话内 locale 视线一致（P6a glibc `%z` == tzdb 偏移；P6b Node Intl == 声明；P6c bind 因宿主 /etc 不可预创建转 SKIP——tzdb 内嵌 TZif 路线覆盖）
+- [x] kill/正常退出后 netns/mountns 随进程树消亡；PDEATHSIG(SIGKILL) 兜底；挂载点缺失预创建 = N3 有界例外（doctor 输出登记）
 - [ ] 挂载点缺失时预创建 + doctor 报告

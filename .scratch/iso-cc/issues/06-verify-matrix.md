@@ -4,7 +4,7 @@
 
 **Blocked by:** 03, 04, 05
 
-**Status:** ready-for-agent
+**Status:** in-progress（v0.2 子集本机绿：P6/P1/P2/P15/P3b + P13 红判；R12 子矩阵与 P16–P27 待接）
 
 - [ ] 4090 + 本机全绿，可 CI 重放
 - [ ] 退出码语义经故障注入验证
