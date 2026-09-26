@@ -51,3 +51,48 @@ rootless 轻量会话：userns+mountns+netns + 用户态网关（pasta）钉死�
 ## Further Notes
 
 宿主矩阵实测记录在 docs/DEPENDENCIES.md；工具面取证基线 = claude-code 2.1.263（版本漂移按 T5 登记流程处理）。
+
+## 变更记录
+
+### 2026-09-26（一）：资源两级模型（替代"绝对 rootless stateless"）
+
+**Requirement**：用户裁决——不介意 rootful 与持久化，条件是（a）rootful 只允许出现在可 install/setup 的声明阶段（一次性、幂等、显式审计），绝不允许每会话 sudo；（b）持久化资源状态必须被定义且回收有保证。
+
+**Specification**：资源分两类 + 一个不可接受态：
+- `session-scoped`：随会话进程树消亡（netns、tap、mounts、网关进程）
+- `setup-manifested`：`iso-cc setup` 创建，清单登记（类型/路径/创建记录），`iso-cc gc`/`uninstall` 精确按清单回收，doctor 双向校验（清单→现实漂移、现实→清单未登记物）
+- `residue`：既不随会话消亡又未登记回收 = 唯一不可接受态
+
+被否替代：维持绝对 rootless（实测迫使每会话 hack：/etc 预创建、PATH 解析网关、杀路径竞态——即用户所指"cosplay stateless"）。R5/R6/N3/D1 措辞修订由设计稿提出行级提案（parent 落 docs/REQUIREMENTS.md）。
+
+**Acceptance**（并入设计稿与后续票）：每个宿主持久物可归类两级之一；residue 集合可被工具枚举且为空；setup 幂等重跑 diff 为零；gc 后清单与现实一致。
+
+### 2026-09-26（二）：Statelessness & Fragility Audit（设计稿强制章节）
+
+**Requirement**：设计稿必须用代码证据硬审计"rootless stateless"主张，禁止叙事自证。
+
+**Specification**：逐条对照 R6/D1/N3 标注 `session-scoped / setup-manifested / residue` 三级 + 代码行号证据；必查嫌疑清单（PDEATHSIG 竞态与 daemon 孙进程持 netns、uid_map 写失败模式、/etc 预创建残留、PATH 解析网关、网关中途死静默断网、state_dir 积累、slirp DNS 不走 egress、locale 仅 TZ env）；每项修复归属 09/11/12 或新票。
+
+**Acceptance**：审计表完整覆盖上述嫌疑；每个非 session-scoped 项有归属票或 open_question。
+
+### 2026-09-26（三）：实现手段开放性（step back and look around）
+
+**Requirement**：需求正本（R1-R12）不动，但实现手段完全开放。任何实施票开工前必须先回答三个问题：①有没有现成工具/项目已满足该需求（build-vs-reuse 裁决）；②该能力有没有维护中的现成组件（CLI 或 crate）；③用成熟 CLI 组合是否优于自研 Rust 组件。禁止在未登记"轮子盘点"的票上写实现。
+
+**Specification**：全项目级复验已有裁决的时效性——D2 对 Docker/容器、D7 对网关选型、D4 对 tun2socks 自研的拒绝理由必须对照 2026 当前的上游现状重新验证（podman rootless+pasta、bwrap、RootlessKit、claude-code 原生 sandbox 等），确认拒绝仍成立才可沿用手写路线。已有代码（session.rs 等）视为沉没成本，不构成继续手搓的理由。
+
+**Acceptance**：alternatives 扫描报告落 `.scratch/iso-cc/research/` 并给出三选一裁决（直接复用 / 薄编排成熟 CLI / 继续自研）+ 逐条证据；每个实施票含"轮子盘点"小节。
+
+### 2026-09-26（四）：身份范围与 bash 执行位置解耦（修正 D8/US17 捆绑）
+
+**Requirement**：`net.scope=self` 把两件正交的事捆成了一个原子声明（cc 本体进 netns + bash 工具宿主侧执行）。两轴必须可独立声明。
+
+**Specification**：两条正交轴——
+1. `net.scope = tree | self`：**身份范围**。tree = 整棵进程树进 netns（US2 一致性）；self = 仅 cc 本体进 netns。
+2. `exec.bash = sandbox | host`：**bash 工具执行位置**。sandbox = 会话内执行（继承 netns，US2 满满但 localhost 指向会话自身）；host = 经 exec RPC 通道宿主侧执行（US9 真 localhost；代价 = bash 工具流量走宿主出口，身份一致性让位——显式声明换取，不是静默）。
+
+组合语义：`tree+sandbox`（现状默认）；`tree+host`（身份钉定 + 集成测试真 localhost——bash 流量走宿主出口是声明性代价）；`self+host`（原 self 全语义）；`self+sandbox`（合法但少见）。verify 语义按组合收窄：P1/P13–P15 恒测 cc 本体出口；host 组合下 bash 面不在出口断言范围（探针经 netns fd setns 保持可测，ADR 0008 附⑥）。
+
+机制正本 = ADR 0008 附/附2/附3（exec.sock RPC、拦截分层 L1/L1.5/L2/L3/L4、multi-call shim、cc 2.1.263 工具面取证：hooks/REPL/statusline 硬编码 /bin/sh，L1.5=CLAUDE_CODE_SHELL_PREFIX 优先验证）。
+
+**Acceptance**：config 出现两独立声明面；`--print-plan` 展开组合；票 15 落地后自证探针（会话内 exec 标记二进制 → 断言落点宿主侧/沙箱侧与声明一致）。

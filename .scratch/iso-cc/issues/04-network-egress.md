@@ -6,6 +6,8 @@
 
 **Status:** in-progress（slirp4netns 传输本机绿；4090 egress 语义待验）
 
+> **2026-09-26 实施重排**：发现 slirp 硬编码违反 ADR 0007（pasta 才是 primary）且 egress 接口纯装饰（fail-open）。实施拆入 **09**（provider 化 + fail-loud，A1 无阻塞）与 **10**（本机 pasta attach TUNSETIFF 调查，阻塞 09/A2）。本票 4090 验收沿用 09/A2 结论。
+
 - [x] 会话内 `curl -4 ifconfig.me` = 103.155.37.8（本机宿主出口；4090 上应为 7891 出口 64.118.144.224——**需 embedded SOCKS provider 或隧道侧 TUN**，D4 修订）
 - [ ] 宿主浏览器直开会话内 dev server（localhost 同端口）
 - [ ] 会话内经网关地址访问宿主 loopback-only 服务

@@ -8,7 +8,8 @@ pub struct Session {
     pub id: String,
 }
 
-/// 扫描 /proc 中带 ISO_CC_SESSION 标记的进程（网关进程）。
+/// 扫描 /proc 中带 ISO_CC_SESSION 标记的进程（双标记，设计稿 §4-L3：网关 pasta/slirp
+/// 由 Command::env 注入；cc 树由 session-bootstrap 依 --session-id 自设）。
 /// 状态零持久：会话死 = 标记消失 = list 自然收敛。
 pub fn scan() -> Vec<Session> {
     let mut out = Vec::new();

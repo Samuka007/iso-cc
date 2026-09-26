@@ -3,6 +3,7 @@ mod doctor;
 mod list;
 mod plan;
 mod probe;
+mod provider;
 mod session;
 
 use anyhow::{bail, Context as _};
@@ -74,8 +75,12 @@ enum Commands {
     /// 内部：会话引导（等 tap0 → 配网 → exec）
     #[command(hide = true)]
     SessionBootstrap {
+        /// bootstrap plan JSON（session::BootstrapPlan；deny_unknown_fields，#5 fail-loud）
         #[arg(long)]
-        egress_iface: String,
+        plan: String,
+        /// 会话 id（bootstrap 自设 ISO_CC_SESSION 标记，§1.4）
+        #[arg(long)]
+        session_id: String,
         #[arg(last = true)]
         command: Vec<OsString>,
     },
@@ -123,9 +128,10 @@ fn run() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Commands::SessionBootstrap {
-            egress_iface,
+            plan,
+            session_id,
             command,
-        }) => session::bootstrap(&egress_iface, &command),
+        }) => session::bootstrap_run(&plan, &session_id, &command),
         None => {
             println!("iso-cc — see `iso-cc --help`");
             Ok(())
@@ -163,6 +169,10 @@ fn cmd_run(
         eprintln!("note: {w}");
     }
     let (name, prof) = resolve(&cfg, &profile)?;
+    // fail-loud #12（config 期：-I 撞名类 egress 直接拒绝）+ #3（宿主 sysfs，spawn 前断言，
+    // R8 绝不回落）。--print-plan 同样断言：计划必须可按所印执行。
+    provider::validate_egress_iface(prof.egress_iface()?)?;
+    provider::host_iface_up(prof.egress_iface()?)?;
     let plan = plan::plan_lines(&name, &prof, command.first());
     if print_plan || command.is_empty() {
         for l in plan {

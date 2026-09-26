@@ -1,7 +1,35 @@
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
+
+/// 网关 DNS 转发地址默认值（pasta `--dns-forward` 与 slirp4netns 内建转发器同址）。
+pub const DEFAULT_DNS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
+
+/// 网关形态（设计稿 §1）：`pasta` spawn 模式会话根（默认）| `slirp4netns` 回退（attach + selfmap）。
+/// 未知取值 = 配置错误（serde unknown variant，fail-loud #1）。
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NetGateway {
+    Pasta,
+    Slirp4netns,
+}
+
+impl NetGateway {
+    pub fn bin_name(self) -> &'static str {
+        match self {
+            NetGateway::Pasta => "pasta",
+            NetGateway::Slirp4netns => "slirp4netns",
+        }
+    }
+}
+
+impl std::fmt::Display for NetGateway {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.bin_name())
+    }
+}
 
 /// 顶层配置：`~/.config/iso-cc/config.toml`（全局）+ 可选项目级 `.iso-cc.toml` 覆盖。
 ///
@@ -57,6 +85,12 @@ pub struct Net {
     /// RFC1918 目的地路由策略：`tunnel`（默认）| `host`（宿主 LAN 直连，显式 opt-in）。
     #[serde(default)]
     pub private: Option<NetPrivate>,
+    /// 网关形态：`pasta`（默认，spawn 模式会话根）| `slirp4netns`（回退，attach + selfmap）。
+    #[serde(default)]
+    pub gateway: Option<NetGateway>,
+    /// 网关 DNS 转发地址（pasta `--dns-forward`；未声明 = 10.0.2.3）。
+    #[serde(default)]
+    pub dns: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -106,6 +140,16 @@ impl Profile {
     /// 生效 IPv6 策略（未声明 = off，fail-closed）。
     pub fn ipv6(&self) -> NetIpv6 {
         self.net.ipv6.unwrap_or(NetIpv6::Off)
+    }
+
+    /// 生效网关形态（未声明 = pasta，spawn 会话根）。
+    pub fn gateway(&self) -> NetGateway {
+        self.net.gateway.unwrap_or(NetGateway::Pasta)
+    }
+
+    /// 生效 DNS 转发地址（未声明 = 10.0.2.3）。
+    pub fn dns(&self) -> Ipv4Addr {
+        self.net.dns.unwrap_or(DEFAULT_DNS)
     }
 
     /// 结构校验：返回错误清单（空 = 通过）。宿主事实检查归 doctor，不在这里。
@@ -293,7 +337,30 @@ agent.command = "claude"
         let p = cfg.profile.get("x").unwrap();
         assert_eq!(p.scope(), NetScope::Tree);
         assert_eq!(p.ipv6(), NetIpv6::Off);
+        assert_eq!(p.gateway(), NetGateway::Pasta);
+        assert_eq!(p.dns(), DEFAULT_DNS);
         assert!(p.net.localhost_forward.is_empty());
+    }
+
+    #[test]
+    fn gateway_and_dns_parse() {
+        let cfg: Config = toml::from_str(
+            "version = 1\n[profile.x]\negress = 'if:wg0'\nnet.gateway = 'slirp4netns'\nnet.dns = '1.1.1.1'",
+        )
+        .unwrap();
+        let p = cfg.profile.get("x").unwrap();
+        assert_eq!(p.gateway(), NetGateway::Slirp4netns);
+        assert_eq!(p.gateway().bin_name(), "slirp4netns");
+        assert_eq!(p.dns(), Ipv4Addr::new(1, 1, 1, 1));
+    }
+
+    #[test]
+    fn unknown_gateway_value_rejected() {
+        let err = toml::from_str::<Config>(
+            "version = 1\n[profile.x]\negress = 'if:w'\nnet.gateway = 'vpn'",
+        )
+        .expect_err("未知 gateway 取值必须 fail-loud（#1）");
+        assert!(err.to_string().contains("unknown variant"), "{err}");
     }
 
     #[test]

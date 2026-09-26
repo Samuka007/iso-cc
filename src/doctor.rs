@@ -1,4 +1,4 @@
-use crate::config::{Config, Profile};
+use crate::config::{Config, NetGateway, Profile};
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -176,7 +176,10 @@ pub fn run(
     // 2. egress 接口 + 路由（R7/D4）
     match profile.egress_iface() {
         Ok(iface) => {
-            if sys.iface_exists(iface) {
+            // #12 `-I` 撞名断言：outbound 名与目标 ns 既有接口撞名类直接拒绝
+            if let Err(e) = crate::provider::validate_egress_iface(iface) {
+                out.push(Check::new("egress/iface", Status::Fail, e.to_string()));
+            } else if sys.iface_exists(iface) {
                 out.push(Check::new("egress/iface", Status::Ok, iface));
                 let status = if sys.iface_has_default_route(iface) {
                     Status::Ok
@@ -219,25 +222,29 @@ pub fn run(
         ));
     }
 
-    // 4. provider（R11/D7）
-    let pasta = sys.which("pasta");
-    let slirp = sys.which("slirp4netns");
-    match (&pasta, &slirp) {
-        (Some(p), _) => out.push(Check::new(
-            "provider/pasta",
+    // 4. provider（R11/D7）——按 config 选择的 gateway fail-loud（#2 过渡态：which + 显式
+    //    报错；绝对路径 + 版本钉定归 14 清单态）
+    let gateway = profile.gateway();
+    let bin_name = gateway.bin_name();
+    match sys.which(bin_name) {
+        Some(p) => out.push(Check::new(
+            "provider/selected",
             Status::Ok,
-            p.display().to_string(),
+            format!("net.gateway={gateway} → {}", p.display()),
         )),
-        (None, Some(s)) => out.push(Check::new(
-            "provider/slirp4netns",
-            Status::Ok,
-            format!("{}（回退 provider）", s.display()),
-        )),
-        (None, None) => out.push(Check::new(
-            "provider",
+        None => out.push(Check::new(
+            "provider/selected",
             Status::Fail,
-            "pasta 与 slirp4netns 均未安装",
+            format!("{bin_name} 不在 PATH（net.gateway={gateway}，fail-loud #2 过渡态；缺失报包名：passt / slirp4netns 或上游静态单文件）"),
         )),
+    }
+    // #11：slirp 模式 DNS 上游=宿主 resolver（内建转发器）→ R1 降级恒 Warn（P3b/P13 现形）
+    if gateway == NetGateway::Slirp4netns {
+        out.push(Check::new(
+            "provider/dns",
+            Status::Warn,
+            "slirp4netns 模式 DNS 上游=宿主 resolver（内建转发，R1 降级）",
+        ));
     }
 
     // 5. agent 发现（R9/D3：advisory）
@@ -490,5 +497,91 @@ mod tests {
         assert!(checks
             .iter()
             .any(|c| c.name == "userns/apparmor" && c.status == Status::Warn));
+    }
+
+    #[test]
+    fn slirp_gateway_selection_and_dns_warn() {
+        let p: Profile = toml::from_str("egress = 'if:wg0'\nnet.gateway = 'slirp4netns'").unwrap();
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &FakeSys::default(),
+        );
+        assert!(!any_fail(&checks), "{checks:?}");
+        assert!(checks
+            .iter()
+            .any(|c| c.name == "provider/selected" && c.detail.contains("slirp4netns")));
+        assert!(checks
+            .iter()
+            .any(|c| c.name == "provider/dns" && c.status == Status::Warn));
+    }
+
+    #[test]
+    fn missing_selected_provider_is_fail() {
+        struct NoBin;
+        impl SysInspect for NoBin {
+            fn which(&self, _: &str) -> Option<PathBuf> {
+                None
+            }
+            fn read_sysctl(&self, _: &str) -> io::Result<String> {
+                Err(io::Error::new(io::ErrorKind::NotFound, "n/a"))
+            }
+            fn iface_exists(&self, _: &str) -> bool {
+                true
+            }
+            fn iface_has_route(&self, _: &str) -> bool {
+                true
+            }
+            fn iface_has_default_route(&self, _: &str) -> bool {
+                true
+            }
+            fn path_exists(&self, _: &Path) -> bool {
+                true
+            }
+            fn command_output(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn locale_available(&self, _: &str) -> bool {
+                true
+            }
+            fn resolve_connect(&self, _: &str, _: u16) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let p = profile("if:wg0");
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &NoBin,
+        );
+        assert!(checks.iter().any(|c| c.name == "provider/selected"
+            && c.status == Status::Fail
+            && c.detail.contains("#2")));
+    }
+
+    #[test]
+    fn lo_egress_rejected_by_ns_ifname_rule() {
+        let p = profile("if:lo");
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &FakeSys::default(),
+        );
+        assert!(any_fail(&checks), "{checks:?}");
+        assert!(checks
+            .iter()
+            .any(|c| c.name == "egress/iface" && c.detail.contains("#12")));
     }
 }
