@@ -2,6 +2,8 @@ mod config;
 mod doctor;
 mod list;
 mod plan;
+mod probe;
+mod session;
 
 use anyhow::{bail, Context as _};
 use clap::{Parser, Subcommand};
@@ -31,6 +33,9 @@ enum Commands {
         /// 只打印等价执行计划，不执行
         #[arg(long)]
         print_plan: bool,
+        /// 在会话内运行纯净度探针（代替命令）
+        #[arg(long)]
+        verify: bool,
         /// 要在会话内执行的命令（-- 之后的全部）
         #[arg(last = true)]
         command: Vec<OsString>,
@@ -48,10 +53,6 @@ enum Commands {
     },
     /// 列出存活会话
     List {
-        /// 显式配置文件路径（默认：全局配置 + 项目 .iso-cc.toml）
-        #[arg(long)]
-        config: Option<std::path::PathBuf>,
-        /// 机器可读输出
         #[arg(long)]
         json: bool,
     },
@@ -59,6 +60,24 @@ enum Commands {
     Verify {
         #[arg(long)]
         profile: Option<String>,
+        /// 显式配置文件路径
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+    },
+    /// 内部：探针执行器（verify 经会话调用；勿手动使用）
+    #[command(hide = true)]
+    ProbeJson {
+        /// 期望时区（声明值）
+        #[arg(long)]
+        expect_tz: Option<String>,
+    },
+    /// 内部：会话引导（等 tap0 → 配网 → exec）
+    #[command(hide = true)]
+    SessionBootstrap {
+        #[arg(long)]
+        egress_iface: String,
+        #[arg(last = true)]
+        command: Vec<OsString>,
     },
 }
 
@@ -76,15 +95,37 @@ fn run() -> anyhow::Result<()> {
             profile,
             config,
             print_plan,
+            verify,
             command,
-        }) => cmd_run(config, profile, print_plan, command),
+        }) => {
+            if verify && !command.is_empty() {
+                bail!("--verify 与命令互斥");
+            }
+            if verify {
+                return cmd_verify(profile, config);
+            }
+            cmd_run(config, profile, print_plan, command)
+        }
         Some(Commands::Doctor {
             profile,
             config,
             json,
         }) => cmd_doctor(config, profile, json),
-        Some(Commands::List { config, json }) => cmd_list(config, json),
-        Some(Commands::Verify { profile: _ }) => bail!("verify: not implemented yet (T5)"),
+        Some(Commands::List { json, .. }) => cmd_list(json),
+        Some(Commands::Verify { profile, config }) => cmd_verify(profile, config),
+        Some(Commands::ProbeJson { expect_tz }) => {
+            let probes = probe::run(expect_tz.as_deref().unwrap_or("UTC"));
+            println!("{}", probe::to_json(&probes)?);
+            eprint!("{}", probe::render_human(&probes));
+            if probe::any_fail(&probes) {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Some(Commands::SessionBootstrap {
+            egress_iface,
+            command,
+        }) => session::bootstrap(&egress_iface, &command),
         None => {
             println!("iso-cc — see `iso-cc --help`");
             Ok(())
@@ -134,8 +175,28 @@ fn cmd_run(
     if print_plan {
         return Ok(());
     }
-    // T2/T3/T4 工单落地后走真实执行路径。
-    bail!("会话执行尚未实现（T2/T3/T4）")
+    let session = session::spawn(&name, &prof, session::ChildMode::Exec(command))?;
+    let status = session.wait()?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+fn cmd_verify(profile: Option<String>, config: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    let (cfg, warnings) = load_config(config.as_deref())?;
+    for w in &warnings {
+        eprintln!("note: {w}");
+    }
+    let (name, prof) = resolve(&cfg, &profile)?;
+    let expect_tz = prof.locale.tz.clone();
+    let session = session::spawn(&name, &prof, session::ChildMode::Probe)?;
+    let status = session.wait()?;
+    if !status.success() {
+        bail!("verify 红：环境与声明不一致（详见上方 JSON/摘要）");
+    }
+    let _ = expect_tz;
+    Ok(())
 }
 
 fn cmd_doctor(
@@ -160,9 +221,7 @@ fn cmd_doctor(
     Ok(())
 }
 
-fn cmd_list(config: Option<std::path::PathBuf>, json: bool) -> anyhow::Result<()> {
-    let (cfg, _) = load_config(config.as_deref())?;
-    let _ = cfg; // list 零配置依赖；保留入口一致性
+fn cmd_list(json: bool) -> anyhow::Result<()> {
     let sessions = list::scan();
     if json {
         println!("{}", serde_json::to_string_pretty(&sessions)?);

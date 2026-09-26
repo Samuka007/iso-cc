@@ -14,9 +14,10 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
     ));
     v.push("1. unshare CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWNET".into());
     v.push("2. mountns: make-rprivate /".into());
-    if let Some(tz) = p.locale.tz.as_deref() {
+    if p.locale.tz.is_some() {
+        let tz = p.locale.tz.as_deref().unwrap_or("?");
         v.push(format!(
-            "3. bind /usr/share/zoneinfo/{tz} -> /etc/localtime (realpath) + /etc/timezone"
+            "3. bind embedded TZif (tzdb: {tz}) -> /etc/localtime + /etc/timezone"
         ));
     } else {
         v.push("3. (no tz declared — host default)".into());
@@ -26,7 +27,7 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
         v.push(format!("4. bind {src} -> {dst}"));
     }
     v.push(format!(
-        "5. pasta attach: -i {iface} --map-host-loopback (egress pinned)"
+        "5. slirp4netns attach: child tap0 (gateway 10.0.2.2, DNS 10.0.2.3), egress-iface={iface} 供接口形态 provider 使用"
     ));
     if p.ipv6() == NetIpv6::Off {
         v.push("6. disable ipv6 in netns (fail-closed)".into());
@@ -70,7 +71,7 @@ mod tests {
         let p = prof("egress = 'if:wg0'\nlocale.tz = 'Asia/Singapore'");
         let lines = plan_lines("sg", &p, None);
         let joined = lines.join("\n");
-        assert!(joined.contains("-i wg0"));
+        assert!(joined.contains("slirp4netns"));
         assert!(joined.contains("disable ipv6"));
         assert!(joined.contains("Asia/Singapore"));
         assert!(joined.contains("scope=Tree"));
