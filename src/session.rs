@@ -1,4 +1,5 @@
 use crate::config::{NetGateway, NetIpv6, Profile};
+use crate::list;
 use crate::netcfg;
 use crate::ns;
 use crate::provider;
@@ -40,6 +41,62 @@ pub struct Session {
     pub root: Child,
     /// attach 型网关（仅 slirp 回退）；pasta 即根时为 None。
     pub gateway: Option<Child>,
+    /// 会话资产目录（正常退出后回收；残留交 doctor sweep 上报）。
+    pub sess_dir: PathBuf,
+}
+
+// ===== 生命周期三层防线（票 13；设计稿 design-session-lanes §4）=====
+//
+// unsafe 纪律：PR_SET_CHILD_SUBREAPER / kill(2) / waitpid(2) 三个生命周期内核原语
+// 在此以 libc 裸调用 + SAFETY 注释落地（票 13 契约文件集不含 ns.rs 与 Cargo.toml，
+// nix "signal" feature 不可引入）；每个 unsafe 块只包单次 syscall。
+
+/// L2 执行者（设计稿 §4-L2）：iso-cc 自设 PR_SET_CHILD_SUBREAPER(1)——会话树中任何
+/// 进程的父链断掉时 reparent 到 iso-cc 而非 init，[`Session::wait`] 的收编循环得以
+/// 直杀（CompScan #6：subreaper 与 PDEATHSIG 是配套机制；轮子盘点：内核原语，
+/// 拒绝 systemd-run --scope 与第三方看护 crate）。
+fn set_child_subreaper() -> anyhow::Result<()> {
+    // SAFETY: prctl(2) 单参数变体，作用于 iso-cc 主进程自身，无 fork/exec 上下文
+    // 前置条件；失败仅 EINVAL（参数非法，此处不可能）。
+    let rc = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+    if rc != 0 {
+        return Err(anyhow!(
+            "PR_SET_CHILD_SUBREAPER 失败: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// spawn 后 `?` 早退路径的泄漏面兜底（audit-facts §3/§6「spawn 错误路径孤儿」）：
+/// arm 到 disarm 之间任何 `?` 早退，Drop 侧 SIGKILL + waitpid 收尸。
+struct KillGuard {
+    pid: Option<u32>,
+}
+
+impl KillGuard {
+    fn arm(pid: u32) -> Self {
+        Self { pid: Some(pid) }
+    }
+
+    /// 成功路径：pid 所有权移交 Session，guard 析构为 no-op。
+    fn disarm(mut self) -> u32 {
+        self.pid.take().expect("KillGuard 双重 disarm")
+    }
+}
+
+impl Drop for KillGuard {
+    fn drop(&mut self) {
+        let Some(pid) = self.pid.take() else { return };
+        // SAFETY: kill(2)/waitpid(2) 作用于本进程刚 spawn 的直接子女（spawn 返回值到
+        // Session 构造之间的窗口）；SIGKILL 不可捕获，waitpid 收尸防僵尸。子进程已自行
+        // 退出并被 try_wait reap → kill 得 ESRCH、waitpid 得 ECHILD，均忽略。
+        let killed = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } == 0;
+        unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) };
+        if killed {
+            eprintln!("[iso-cc] KillGuard: spawn 错误路径击杀泄漏子进程 pid={pid}");
+        }
+    }
 }
 
 pub enum ChildMode {
@@ -56,6 +113,8 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
     provider::validate_egress_iface(&egress_iface)?;
     // fail-loud #3：宿主 egress 接口存在且 UP（sysfs，spawn 前断言；R8 绝不回落）
     provider::host_iface_up(&egress_iface)?;
+    // L2（设计稿 §4-L2）：会话树建立前自设 subreaper——收编循环的 reparent 前提。
+    set_child_subreaper()?;
 
     let gateway = profile.gateway();
     let dns = profile.dns();
@@ -209,6 +268,8 @@ fn spawn_pasta(
     let mut pasta = gw
         .spawn()
         .with_context(|| format!("spawn pasta（{}）", pasta_bin.display()))?;
+    // KillGuard（audit-facts §3）：pasta 已 spawn，此后任何 `?` 早退不得遗留存活子进程
+    let guard = KillGuard::arm(pasta.id());
 
     // fail-loud #4：pasta 前台早期退出检测（1s try_wait）+ gateway.log tail。
     // 判别键 = bootstrap 是否已 exec（bootstrapped 标记文件）：pasta 的退出码对 child
@@ -231,9 +292,11 @@ fn spawn_pasta(
         profile.scope(),
         sess_dir.display()
     );
+    guard.disarm();
     Ok(Session {
         root: pasta,
         gateway: None,
+        sess_dir: sess_dir.to_path_buf(),
     })
 }
 
@@ -270,6 +333,9 @@ fn spawn_slirp(
         .stderr(Stdio::inherit())
         .spawn()
         .context("spawn session-bootstrap（selfmap）")?;
+    // KillGuard（audit-facts §3）：bootstrap 已 spawn；网关 spawn 失败的 `?` 早退路径
+    // 不得遗留已进 ns 的 bootstrap 子进程（旧 :163-170 泄漏面）
+    let root_guard = KillGuard::arm(root.id());
 
     // slirp4netns attach：`<pid> tap0 -c`；双标记之一：slirp 自身带 ISO_CC_SESSION
     let log_file = sess_dir.join("gateway.log");
@@ -286,6 +352,7 @@ fn spawn_slirp(
     let gateway = gw
         .spawn()
         .with_context(|| format!("spawn slirp4netns（{}）", slirp_bin.display()))?;
+    let gw_guard = KillGuard::arm(gateway.id());
 
     eprintln!(
         "[iso-cc] session {session_id}: root=bootstrap(pid={}) gateway=slirp4netns(pid={}, attach) scope={:?} assets={}",
@@ -294,9 +361,12 @@ fn spawn_slirp(
         profile.scope(),
         sess_dir.display()
     );
+    root_guard.disarm();
+    gw_guard.disarm();
     Ok(Session {
         root,
         gateway: Some(gateway),
+        sess_dir: sess_dir.to_path_buf(),
     })
 }
 
@@ -372,12 +442,61 @@ impl Session {
                 let _ = gw.wait();
             }
         }
+        // L2 收编循环（设计稿 §4-L2）：PDEATHSIG fork 即清、孙进程不在 L1 覆盖面
+        // （audit-facts §6），setsid 逃逸者经 subreaper reparent 到本进程，此处直杀。
+        self.reap_adopted();
+        // 会话资产回收（spawn() 09 期注释契约「会话结束后的回收归 13 sweep」）：目录内
+        // 全部为可再生资产（localtime/timezone/resolv.conf/gateway.log/bootstrapped），
+        // R4 持久态（~/.claude）不在会话目录。回收失败交 L3 sweep 上报（doctor）。
+        if let Err(e) = std::fs::remove_dir_all(&self.sess_dir) {
+            eprintln!(
+                "[iso-cc] note: 会话资产目录 {} 回收失败（{e}）——交 doctor sweep（L3）上报",
+                self.sess_dir.display()
+            );
+        }
         Ok(status)
+    }
+
+    /// L2 收编（设计稿 §4-L2 + PM 修订双键定界）：收编范围 = 会话根后裔（subreaper
+    /// 语义下 reparent 后 = 本进程子女）∩ ISO_CC_SESSION 标记。标记者 SIGKILL + reap；
+    /// 无标记者只登记上报、不杀（票 15 host 执行语义预留）。循环至一轮扫描无标记子女
+    /// （每轮至少收编一个，进程数有限 → 终止）。
+    fn reap_adopted(&mut self) {
+        let self_pid = std::process::id();
+        loop {
+            let mut reaped = false;
+            for pid in list::children_of(self_pid) {
+                match list::proc_marker(pid) {
+                    Some(id) => {
+                        // SAFETY: kill(2)/waitpid(2)；pid = reparent 到本进程的收养子女
+                        // （subreaper 语义，waitpid 合法）。已死未收尸者 kill 得 ESRCH、
+                        // waitpid 直接收尸；存活者 SIGKILL 不可捕获，阻塞收尸。
+                        unsafe {
+                            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                            libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
+                        }
+                        eprintln!(
+                            "[iso-cc] L2 收编: 孤儿 pid={pid}（ISO_CC_SESSION={id}）→ SIGKILL + reaped"
+                        );
+                        reaped = true;
+                    }
+                    None => {
+                        eprintln!(
+                            "[iso-cc] L2 登记: 收养孤儿 pid={pid} 无 ISO_CC_SESSION 标记——不杀（host 执行语义预留，票 15）；无标记即 doctor sweep 域外"
+                        );
+                    }
+                }
+            }
+            if !reaped {
+                return;
+            }
+        }
     }
 }
 
-/// 会话资产根：`~/.local/state/iso-cc/sessions/`（13 sweep 的枚举基础，§4-L3）。
-fn sessions_root() -> anyhow::Result<PathBuf> {
+/// 会话资产根：`~/.local/state/iso-cc/sessions/`（13 sweep 的枚举基础，§4-L3；
+/// list::session_dir_names 复用）。
+pub(crate) fn sessions_root() -> anyhow::Result<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     Ok(Path::new(&home).join(".local/state/iso-cc/sessions"))
 }

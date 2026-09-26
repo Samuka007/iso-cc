@@ -1,4 +1,5 @@
 use crate::config::{Config, NetGateway, Profile};
+use crate::list::LifecycleResidue;
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -49,6 +50,10 @@ pub trait SysInspect {
     fn command_output(&self, cmd: &str) -> Option<String>;
     fn locale_available(&self, lang: &str) -> bool;
     fn resolve_connect(&self, host: &str, port: u16) -> Result<(), String>;
+    /// L3 sweep 注入缝（票 13）：孤儿网关 + 无主会话目录。default = 无 residue。
+    fn lifecycle_residue(&self) -> LifecycleResidue {
+        LifecycleResidue::default()
+    }
 }
 
 pub struct RealSys;
@@ -107,6 +112,9 @@ impl SysInspect for RealSys {
             }
         }
         Err(last)
+    }
+    fn lifecycle_residue(&self) -> LifecycleResidue {
+        crate::list::sweep_residue()
     }
 }
 
@@ -296,6 +304,55 @@ pub fn run(
         ));
     }
 
+    // 8. lifecycle sweep（票 13 L3，fail-loud #10）：孤儿网关（pasta=argv 键 /
+    //    slirp=env 键）+ 无主会话目录。现役 residue = Fail；清除动作归 gc（票 14）。
+    let residue = sys.lifecycle_residue();
+    if residue.gateways.is_empty() {
+        out.push(Check::new(
+            "sweep/orphan-gateways",
+            Status::Ok,
+            "无孤儿网关（pasta=argv 指纹 / slirp=env 标记，L3 sweep）",
+        ));
+    } else {
+        let det = residue
+            .gateways
+            .iter()
+            .map(|g| {
+                let sid = g.session_id.as_deref().unwrap_or("?");
+                format!(
+                    "pid={} kind={} session={sid} cmd={:?}",
+                    g.pid, g.kind, g.cmdline
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        out.push(Check::new(
+            "sweep/orphan-gateways",
+            Status::Fail,
+            format!(
+                "孤儿网关 ×{}：{det}（清除动作归 gc，票 14）",
+                residue.gateways.len()
+            ),
+        ));
+    }
+    if residue.dirs.is_empty() {
+        out.push(Check::new(
+            "sweep/orphan-dirs",
+            Status::Ok,
+            "无无主会话目录（sessions/* 均有活跃会话归属或已回收）",
+        ));
+    } else {
+        out.push(Check::new(
+            "sweep/orphan-dirs",
+            Status::Fail,
+            format!(
+                "无主会话目录 ×{}：{}（清除动作归 gc，票 14）",
+                residue.dirs.len(),
+                residue.dirs.join(", ")
+            ),
+        ));
+    }
+
     out
 }
 
@@ -333,6 +390,7 @@ mod tests {
         clone_switch: Option<String>,
         iface: bool,
         default_route: bool,
+        residue: LifecycleResidue,
     }
 
     impl Default for FakeSys {
@@ -342,6 +400,7 @@ mod tests {
                 clone_switch: None,
                 iface: true,
                 default_route: true,
+                residue: LifecycleResidue::default(),
             }
         }
     }
@@ -385,6 +444,9 @@ mod tests {
         }
         fn resolve_connect(&self, _host: &str, _port: u16) -> Result<(), String> {
             Ok(())
+        }
+        fn lifecycle_residue(&self) -> LifecycleResidue {
+            self.residue.clone()
         }
     }
 
@@ -497,6 +559,66 @@ mod tests {
         assert!(checks
             .iter()
             .any(|c| c.name == "userns/apparmor" && c.status == Status::Warn));
+    }
+
+    #[test]
+    fn sweep_residue_fails_doctor() {
+        let sys = FakeSys {
+            residue: LifecycleResidue {
+                gateways: vec![crate::list::GatewayResidue {
+                    pid: 4242,
+                    kind: "pasta".into(),
+                    session_id: None,
+                    cmdline: "bash -c sleep 299 x --outbound-if4 eth0".into(),
+                }],
+                dirs: vec!["crash-9".into()],
+            },
+            ..Default::default()
+        };
+        let p = profile("if:wg0");
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &sys,
+        );
+        let gw = checks
+            .iter()
+            .find(|c| c.name == "sweep/orphan-gateways")
+            .expect("sweep/orphan-gateways 检查存在");
+        assert_eq!(gw.status, Status::Fail);
+        assert!(gw.detail.contains("4242"), "{}", gw.detail);
+        assert!(gw.detail.contains("--outbound-if4"), "{}", gw.detail);
+        let dirs = checks
+            .iter()
+            .find(|c| c.name == "sweep/orphan-dirs")
+            .expect("sweep/orphan-dirs 检查存在");
+        assert_eq!(dirs.status, Status::Fail);
+        assert!(dirs.detail.contains("crash-9"), "{}", dirs.detail);
+        assert!(any_fail(&checks));
+    }
+
+    #[test]
+    fn sweep_clean_is_ok() {
+        let p = profile("if:wg0");
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &FakeSys::default(),
+        );
+        assert!(checks
+            .iter()
+            .any(|c| c.name == "sweep/orphan-gateways" && c.status == Status::Ok));
+        assert!(checks
+            .iter()
+            .any(|c| c.name == "sweep/orphan-dirs" && c.status == Status::Ok));
     }
 
     #[test]

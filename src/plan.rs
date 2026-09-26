@@ -66,7 +66,7 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
     );
     if p.ipv6() == NetIpv6::Off {
         v.push(
-            "7. ipv6=off: /proc/sys disable_ipv6 direct-write lands with issue 12 (declared in bootstrap plan; sysctl sh removed in 09)".into(),
+            "7. ipv6=off: /proc/sys disable_ipv6 direct-write in bootstrap (landed with issue 12; sysctl sh removed in 09)".into(),
         );
     }
     for port in &p.net.localhost_forward {
