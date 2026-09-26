@@ -1,0 +1,18 @@
+# iso-cc 配置样例（复制到 ~/.config/iso-cc/config.toml 或项目 .iso-cc.toml）
+# 词汇与字段语义见 docs/REQUIREMENTS.md R1–R12 与 CONTEXT.md。
+
+version = 1
+
+[profile.sg]
+egress = "if:wg0"                # 只引用，不管理（D4：隧道侧负责接口存在且有路由）
+locale.tz = "Asia/Singapore"
+locale.lang = "en_SG.UTF-8"      # 未生成本地 locale 时回退 C.UTF-8（doctor 警告）
+net.scope = "tree"               # tree（整树进 netns）| self（cc 本体 netns + bash RPC 转发宿主）
+net.ipv6 = "off"                 # 默认 fail-closed
+net.localhost_forward = []       # 需要在 netns 内以 127.0.0.1 访问宿主 loopback 服务时填端口
+net.private = "tunnel"           # RFC1918 默认随隧道走；"host" 为显式 LAN 直连
+agent.command = "claude"         # 宿主管理的 cc 入口（D3）
+# agent.version = "2.1"          # advisory：不匹配仅警告
+
+[profile.sg.env]
+# HISTFILE = "/tmp/iso-cc-hist"
