@@ -2,6 +2,7 @@
 //! argv 展开是 plan 打印与实际 spawn 的单一事实源（§7 D5：`--print-plan` 终点 = 等价 CLI 组合）。
 
 pub mod pasta;
+pub mod socks;
 pub mod slirp;
 
 use crate::config::NetGateway;
@@ -20,6 +21,25 @@ pub(crate) fn which(bin: &str) -> Option<PathBuf> {
         .find(|cand| cand.is_file())
 }
 
+/// 多候选名 which（首个命中即返回）：tun2proxy 上游叫 `tun2proxy`、nixpkgs 叫
+/// `tun2proxy-bin`——清单 key 恒 [`socks::WORKER_KEY`]，与 bin 名解耦。
+pub(crate) fn which_any(bins: &[&str]) -> Option<PathBuf> {
+    bins.iter().find_map(|b| which(b))
+}
+
+/// 宿主默认路由接口（`/proc/net/route` 目的地址 00000000 的首条；socks 形态下即
+/// pasta 的 outbound —— 宿主 egress 语义保持「跟随宿主路由事实」）。缺失 = fail-loud。
+pub fn host_default_iface() -> anyhow::Result<String> {
+    let text = std::fs::read_to_string("/proc/net/route")
+        .map_err(|e| anyhow!("#3 读取 /proc/net/route 失败（宿主默认路由接口不可得）: {e}"))?;
+    for line in text.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 3 && cols[1] == "00000000" {
+            return Ok(cols[0].to_string());
+        }
+    }
+    bail!("#3 /proc/net/route 无默认路由（目的 00000000）；宿主无出口，R8：绝不回落");
+}
 /// provider `--version` 输出（trim 后；setup 登记 / doctor 漂移比对的版本事实源）。
 pub(crate) fn version_output(bin: &Path) -> anyhow::Result<String> {
     let out = std::process::Command::new(bin)
@@ -46,23 +66,23 @@ pub(crate) fn version_output(bin: &Path) -> anyhow::Result<String> {
     Ok(v)
 }
 
-/// fail-loud #2（票 14 清单态，替换 09 期过渡态 which 解析）：所选 gateway 的可执行
-/// 从清单钉定（绝对路径 + 版本登记）。清单缺失 / 条目缺失 / 路径不可执行 = Fail，
+/// fail-loud #2（票 14 清单态，替换 09 期过渡态 which 解析）：provider 可执行从清单
+/// 钉定（绝对路径 + 版本登记）。清单缺失 / 条目缺失 / 路径不可执行 = Fail，
 /// 提示 setup；run/doctor 的会话上树一律消费钉定路径（稀疏 PATH 生效的前提）。
-pub fn gateway_bin(gateway: NetGateway) -> anyhow::Result<PathBuf> {
-    let name = gateway.bin_name();
+/// gateway（pasta/slirp4netns）与 socks worker（tun2proxy）共用本门。
+pub fn pinned_bin(name: &str) -> anyhow::Result<PathBuf> {
     let manifest = crate::manifest::read().map_err(|e| {
         anyhow!("清单不可读（fail-loud #2）：{e}；修复或删除 {} 后重跑 `iso-cc setup`",
             crate::manifest::manifest_path().display())
     })?;
     let Some(m) = manifest else {
         anyhow::bail!(
-            "清单缺失（fail-loud #2）：net.gateway={gateway} 绝对路径未钉定——先运行 `iso-cc setup`"
+            "清单缺失（fail-loud #2）：provider {name} 绝对路径未钉定——先运行 `iso-cc setup`"
         )
     };
     let entry = m.find(crate::manifest::EntryKind::Provider, name).ok_or_else(|| {
         anyhow!(
-            "清单无 {name} 条目（fail-loud #2）：net.gateway={gateway} 未登记——先运行 `iso-cc setup --profile <n>`"
+            "清单无 {name} 条目（fail-loud #2）：未登记——先运行 `iso-cc setup --profile <n>`"
         )
     })?;
     let path = entry.path.clone().ok_or_else(|| {
@@ -78,6 +98,11 @@ pub fn gateway_bin(gateway: NetGateway) -> anyhow::Result<PathBuf> {
         );
     }
     Ok(path)
+}
+
+/// gateway 形态的钉定路径（[`pinned_bin`] 的 NetGateway 便捷封装）。
+pub fn gateway_bin(gateway: NetGateway) -> anyhow::Result<PathBuf> {
+    pinned_bin(gateway.bin_name())
 }
 
 /// fail-loud #12：`-I` 撞名断言——outbound 名与目标 ns 既有接口撞名类直接拒绝。

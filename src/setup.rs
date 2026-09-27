@@ -51,30 +51,36 @@ pub fn converge(profile_name: &str, profile: &Profile) -> anyhow::Result<(Vec<Ac
 
     // ① provider 收敛：which + --version → 绝对路径+版本 upsert（仅事实变化时——
     //    registered_at 是 mountpoint 守卫基准，provider 无此依赖，但幂等要求 diff=0）。
-    let gateway = profile.gateway();
-    let bin = gateway.bin_name();
-    let path = crate::provider::which(bin).ok_or_else(|| {
-        anyhow!(
-            "setup：provider {bin} 不在 PATH（net.gateway={gateway}）；缺失报包名：passt / slirp4netns 或上游静态单文件——setup 不代装"
-        )
-    })?;
-    let version = crate::provider::version_output(&path)?;
-    let changed = manifest
-        .find(EntryKind::Provider, bin)
-        .is_none_or(|e| e.path.as_deref() != Some(path.as_path()) || e.version.as_deref() != Some(version.as_str()));
-    if changed {
-        manifest.upsert(Entry {
-            kind: EntryKind::Provider,
-            key: bin.to_string(),
-            path: Some(path.clone()),
-            version: Some(version.clone()),
-            registered_at: manifest::now_millis(),
-            reason: REASON_PROVIDER.into(),
-        });
-        actions.push(Action {
-            target: format!("provider {bin}"),
-            detail: format!("{}（{version}）", path.display()),
-        });
+    //    socks5 形态（工单 16）额外收敛 tun2proxy worker（清单 key 与 bin 名解耦）。
+    let mut wanted: Vec<(&str, Vec<&str>)> = vec![(profile.gateway().bin_name(), vec![profile.gateway().bin_name()])];
+    if matches!(profile.egress(), Ok(crate::config::Egress::Socks5 { .. })) {
+        wanted.push((crate::provider::socks::WORKER_KEY, crate::provider::socks::BIN_CANDIDATES.to_vec()));
+    }
+    for (key, candidates) in wanted {
+        let path = crate::provider::which_any(&candidates).ok_or_else(|| {
+            anyhow!(
+                "setup：provider {key} 不在 PATH（egress={}）；缺失报包名：passt / slirp4netns / nixpkgs#tun2proxy 或上游静态单文件——setup 不代装",
+                profile.egress
+            )
+        })?;
+        let version = crate::provider::version_output(&path)?;
+        let changed = manifest
+            .find(EntryKind::Provider, key)
+            .is_none_or(|e| e.path.as_deref() != Some(path.as_path()) || e.version.as_deref() != Some(version.as_str()));
+        if changed {
+            manifest.upsert(Entry {
+                kind: EntryKind::Provider,
+                key: key.to_string(),
+                path: Some(path.clone()),
+                version: Some(version.clone()),
+                registered_at: manifest::now_millis(),
+                reason: REASON_PROVIDER.into(),
+            });
+            actions.push(Action {
+                target: format!("provider {key}"),
+                detail: format!("{}（{version}）", path.display()),
+            });
+        }
     }
 
     // ② 挂载点收敛：redirect 集内缺失 mkdir/touch + 登记（insert_new_only 保留原

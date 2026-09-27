@@ -6,7 +6,13 @@ use std::ffi::{OsStr, OsString};
 /// gateway argv 展开与实际 spawn 同源（provider::*::flag_args）——所印即可执行的等价 CLI。
 pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -> Vec<String> {
     let mut v = Vec::new();
-    let iface = p.egress_iface().unwrap_or("<invalid-egress>");
+    let (iface, socks) = match p.egress() {
+        Ok(crate::config::Egress::If(name)) => (name, None),
+        Ok(crate::config::Egress::Socks5 { host, port }) => {
+            ("<host-default-route-iface>".to_string(), Some((host, port)))
+        }
+        Err(_) => ("<invalid-egress>".to_string(), None),
+    };
     let gateway = p.gateway();
     let dns = p.dns();
     v.push(format!(
@@ -16,24 +22,51 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
         p.ipv6(),
         p.net.private.unwrap_or(NetPrivate::Tunnel)
     ));
-    v.push(format!(
-        "0. egress assert: {iface} must exist + UP on host (sysfs #3); lo/tap0 rejected (#12 `-I` rule)"
-    ));
+    match &socks {
+        Some((host, port)) => v.push(format!(
+            "0. egress assert: socks5://{host}:{port} TCP-reachable from host (preflight #B); pasta outbound = host default-route iface (must exist + UP, sysfs #3); R8 no fallback"
+        )),
+        None => v.push(format!(
+            "0. egress assert: {iface} must exist + UP on host (sysfs #3); lo/tap0 rejected (#12 `-I` rule)"
+        )),
+    }
     match gateway {
         NetGateway::Pasta => {
             // pasta 全实参（含 `-I` 硬规则）；plan 期 session-id 未生成 → 占位
             let log = OsStr::new("<sessions/<session-id>/gateway.log>");
-            let flags = provider::pasta::flag_args(iface, dns, log)
-                .iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join(" ");
+            // socks 形态省略显式 outbound（map-host-loopback 失效取证，工单 16）
+            let outbound = if socks.is_some() { None } else { Some(iface.as_str()) };
+            let flags = provider::pasta::flag_args(outbound, dns, log)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
             v.push(format!(
                 "1. gateway=pasta spawn (session root): pasta {flags} -- <iso-cc> session-bootstrap --plan <json> --session-id <session-id> -- <cmd>"
             ));
             v.push(
                 "2. bootstrap(mode=mountns): PDEATHSIG->pasta + getppid check; unshare CLONE_NEWNS; rprivate /; bind_ro x N".into(),
             );
+            if let Some((_, port)) = &socks {
+                let worker_flags = provider::socks::worker_args_for_url(format!(
+                    "socks5://<tap0-gw>:{port}"
+                ))
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ");
+                v.push(format!(
+                    "1b. socks worker (bootstrap spawns in-ns, marked ISO_CC_SESSION, PDEATHSIG->bootstrap): tun2proxy {worker_flags}  (proxy host = tap0 default-route gateway via netlink = pasta gw = host loopback mapping)"
+                ));
+                v.push(
+                    "1b1. worker log sessions/<id>/worker.log; ready = netlink wait tun1; worker death = protocol blackhole (fail-closed R8, never falls back to direct)"
+                        .into(),
+                );
+                v.push(
+                    "1b2. DNS: tun2proxy takes over resolv.conf in-ns (virtual DNS 10.0.0.1 via tun1, remote resolve via proxy; bind_ro override proven in exp16 probe4)"
+                        .into(),
+                );
+            }
         }
         NetGateway::Slirp4netns => {
             v.push(
@@ -236,5 +269,33 @@ mod tests {
         let lines = plan_lines("x", &p, None);
         assert!(lines.iter().any(|l| l.contains("127.0.0.1:5432")));
         assert!(lines.iter().any(|l| l.contains("127.0.0.1:6379")));
+    }
+
+    #[test]
+    fn socks_egress_plan_declares_worker_and_dns_takeover() {
+        let p = prof("egress = 'socks5://127.0.0.1:7891'\nlocale.tz = 'Asia/Singapore'");
+        let lines = plan_lines("sg", &p, None);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("socks5://127.0.0.1:7891 TCP-reachable from host"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("pasta outbound = host default-route iface"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("--tun tun1 --proxy socks5://<tap0-gw>:7891 -s -v info"),
+            "{joined}"
+        );
+        assert!(joined.contains("PDEATHSIG->bootstrap"), "{joined}");
+        assert!(joined.contains("protocol blackhole"), "{joined}");
+        assert!(joined.contains("takes over resolv.conf"), "{joined}");
+        assert!(joined.contains("worker.log"), "{joined}");
+        // pasta 会话根与 -I 硬规则在 socks 形态下原样保留
+        assert!(joined.contains("-I tap0"), "{joined}");
+        assert!(joined.contains("gateway=pasta"), "{joined}");
+        // socks 形态禁止显式 outbound（--outbound-if4 使 map-host-loopback 映射失效）
+        assert!(!joined.contains("--outbound-if4"), "{joined}");
     }
 }

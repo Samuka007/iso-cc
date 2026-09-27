@@ -56,6 +56,15 @@ pub trait SysInspect {
     fn provider_version(&self, path: &Path) -> Option<String>;
     fn locale_available(&self, lang: &str) -> bool;
     fn resolve_connect(&self, host: &str, port: u16) -> Result<(), String>;
+    /// socks 形态 geo 预检的注入缝（工单 16）：经 proxy 对 host:80 发明文 GET，
+    /// 返回 body。RealSys = [`crate::provider::socks::http_get_via_socks5`]。
+    fn socks_http_get(
+        &self,
+        proxy_host: &str,
+        proxy_port: u16,
+        host: &str,
+        path: &str,
+    ) -> Result<String, String>;
     /// L3 sweep 注入缝（票 13）：孤儿网关 + 无主会话目录。default = 无 residue。
     fn lifecycle_residue(&self) -> LifecycleResidue {
         LifecycleResidue::default()
@@ -129,6 +138,15 @@ impl SysInspect for RealSys {
             }
         }
         Err(last)
+    }
+    fn socks_http_get(
+        &self,
+        proxy_host: &str,
+        proxy_port: u16,
+        host: &str,
+        path: &str,
+    ) -> Result<String, String> {
+        crate::provider::socks::http_get_via_socks5(proxy_host, proxy_port, host, 80, path)
     }
     fn lifecycle_residue(&self) -> LifecycleResidue {
         crate::list::sweep_residue()
@@ -205,9 +223,10 @@ pub fn run(
         }
     }
 
-    // 2. egress 接口 + 路由（R7/D4）
-    match profile.egress_iface() {
-        Ok(iface) => {
+    // 2. egress 接口 + 路由（R7/D4）；socks5 形态（工单 16）：proxy 可达 + geo 对照。
+    match profile.egress() {
+        Ok(crate::config::Egress::If(iface)) => {
+            let iface: &str = &iface;
             // #12 `-I` 撞名断言：outbound 名与目标 ns 既有接口撞名类直接拒绝
             if let Err(e) = crate::provider::validate_egress_iface(iface) {
                 out.push(Check::new("egress/iface", Status::Fail, e.to_string()));
@@ -227,6 +246,63 @@ pub fn run(
                     Status::Fail,
                     format!("接口 {iface} 不存在"),
                 ));
+            }
+        }
+        Ok(crate::config::Egress::Socks5 { host, port }) => {
+            // #B 预检（R8 同构）：proxy 端口宿主 TCP 可达 = 会话生命线，缺失即 Fail
+            out.push(match sys.resolve_connect(&host, port) {
+                Ok(()) => Check::new(
+                    "egress/socks-reach",
+                    Status::Ok,
+                    format!("socks5://{host}:{port}"),
+                ),
+                Err(e) => Check::new(
+                    "egress/socks-reach",
+                    Status::Fail,
+                    format!("socks5://{host}:{port} 不可达（{e}）；R8：绝不回落"),
+                ),
+            });
+            // 出口 geo 与声明 locale 对照（P13 宿主侧预检；经 proxy 的最小 SOCKS5 探测）。
+            // 未声明 tz = 无对照基准，跳过；探测不可达/不可解析 = Warn（advisory，verify 为准）；
+            // 对照不符 = Fail（与 P13 同一确定性判定，提前现形）。
+            if let Some(tz) = &profile.locale.tz {
+                match sys.socks_http_get(&host, port, "ip-api.com", "/json") {
+                    Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                        Ok(v) => {
+                            let geo_tz = v["timezone"].as_str().unwrap_or("").to_string();
+                            let cc = v["countryCode"].as_str().unwrap_or("?").to_string();
+                            if geo_tz.is_empty() {
+                                out.push(Check::new(
+                                    "egress/socks-geo",
+                                    Status::Warn,
+                                    format!("geo 无 timezone 字段：{body}"),
+                                ));
+                            } else if geo_tz == *tz {
+                                out.push(Check::new(
+                                    "egress/socks-geo",
+                                    Status::Ok,
+                                    format!("geo={geo_tz}({cc}) == 声明 {tz}"),
+                                ));
+                            } else {
+                                out.push(Check::new(
+                                    "egress/socks-geo",
+                                    Status::Fail,
+                                    format!("geo={geo_tz}({cc}) ≠ 声明 {tz}（P13 将红）"),
+                                ));
+                            }
+                        }
+                        Err(e) => out.push(Check::new(
+                            "egress/socks-geo",
+                            Status::Warn,
+                            format!("geo 响应不可解析：{e}"),
+                        )),
+                    },
+                    Err(e) => out.push(Check::new(
+                        "egress/socks-geo",
+                        Status::Warn,
+                        format!("geo 探测不可达（留档）：{e}"),
+                    )),
+                }
             }
         }
         Err(e) => out.push(Check::new("egress/iface", Status::Fail, e.to_string())),
@@ -339,6 +415,56 @@ pub fn run(
                             ),
                         };
                         out.push(Check::new("provider/selected", status, detail));
+                    }
+                }
+            }
+            // forward：socks worker 清单门（工单 16，#2 同规）：tun2proxy 钉定路径 + 版本
+            if matches!(profile.egress(), Ok(crate::config::Egress::Socks5 { .. })) {
+                match entries.iter().find(|e| {
+                    e.kind == crate::manifest::EntryKind::Provider
+                        && e.key == crate::provider::socks::WORKER_KEY
+                }) {
+                    None => out.push(Check::new(
+                        "provider/worker",
+                        Status::Fail,
+                        format!(
+                            "socks5 egress：清单无 {} 条目（fail-loud #2 清单态）——先运行 `iso-cc setup --profile <n>`；缺失报包名：nixpkgs#tun2proxy 或上游静态单文件",
+                            crate::provider::socks::WORKER_KEY
+                        ),
+                    )),
+                    Some(entry) => {
+                        let path = entry.path.clone().unwrap_or_default();
+                        if !sys.path_executable(&path) {
+                            out.push(Check::new(
+                                "provider/worker",
+                                Status::Fail,
+                                format!(
+                                    "socks5 egress：tun2proxy 钉定路径不可执行 {}（fail-loud #2 清单态）——重跑 `iso-cc setup`",
+                                    path.display()
+                                ),
+                            ));
+                        } else {
+                            let current = sys.provider_version(&path);
+                            let status = if current.as_deref().is_some_and(|c| {
+                                Some(c) == entry.version.as_deref()
+                            }) {
+                                Status::Ok
+                            } else {
+                                Status::Warn
+                            };
+                            let detail = match (&current, &entry.version) {
+                                (Some(c), Some(v)) if c != v => format!(
+                                    "socks5 egress：tun2proxy → {} 版本漂移：清单 {v:?} vs 现实 {c:?}（重跑 setup 收敛）",
+                                    path.display()
+                                ),
+                                _ => format!(
+                                    "socks5 egress：tun2proxy → {}（{}）",
+                                    path.display(),
+                                    current.as_deref().unwrap_or("版本不可测")
+                                ),
+                            };
+                            out.push(Check::new("provider/worker", status, detail));
+                        }
                     }
                 }
             }
@@ -592,6 +718,8 @@ mod tests {
         residue: LifecycleResidue,
         manifest: Result<Option<Vec<crate::manifest::Entry>>, String>,
         exec_ok: bool,
+        /// socks geo 预检注入（工单 16）：None = 探测不可达（Err）。
+        socks_geo: Option<Result<String, String>>,
     }
 
     impl Default for FakeSys {
@@ -604,6 +732,7 @@ mod tests {
                 residue: LifecycleResidue::default(),
                 manifest: Ok(Some(default_manifest())),
                 exec_ok: true,
+                socks_geo: None,
             }
         }
     }
@@ -653,6 +782,15 @@ mod tests {
         }
         fn resolve_connect(&self, _host: &str, _port: u16) -> Result<(), String> {
             Ok(())
+        }
+        fn socks_http_get(
+            &self,
+            _proxy_host: &str,
+            _proxy_port: u16,
+            _host: &str,
+            _path: &str,
+        ) -> Result<String, String> {
+            self.socks_geo.clone().unwrap_or_else(|| Err("探测不可达".into()))
         }
         fn lifecycle_residue(&self) -> LifecycleResidue {
             self.residue.clone()
@@ -762,6 +900,9 @@ mod tests {
             }
             fn resolve_connect(&self, _: &str, _: u16) -> Result<(), String> {
                 Ok(())
+            }
+            fn socks_http_get(&self, _: &str, _: u16, _: &str, _: &str) -> Result<String, String> {
+                Err("unreachable".into())
             }
             fn manifest_state(&self) -> Result<Option<Vec<crate::manifest::Entry>>, String> {
                 Ok(Some(default_manifest()))
@@ -1107,5 +1248,161 @@ mod tests {
         assert!(checks
             .iter()
             .any(|c| c.name == "egress/iface" && c.detail.contains("#12")));
+    }
+
+    fn socks_checks(sys: &FakeSys, egress_toml: &str) -> Vec<Check> {
+        let p: Profile = toml::from_str(egress_toml).unwrap();
+        run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "sg",
+            &p,
+            sys,
+        )
+    }
+
+    fn worker_entry() -> crate::manifest::Entry {
+        // FakeSys.provider_version 恒回 "1.0.0" → 版本一致才断言 Ok 面
+        mentry("tun2proxy", "/usr/bin/fake-t2p", Some("1.0.0"))
+    }
+
+    #[test]
+    fn socks_egress_healthy_is_all_ok() {
+        let mut m = default_manifest();
+        m.push(worker_entry());
+        let sys = FakeSys {
+            manifest: Ok(Some(m)),
+            socks_geo: Some(Ok(
+                r#"{"status":"success","timezone":"Asia/Singapore","countryCode":"SG"}"#.into(),
+            )),
+            ..Default::default()
+        };
+        let checks = socks_checks(
+            &sys,
+            "egress = 'socks5://127.0.0.1:7891'\nlocale.tz = 'Asia/Singapore'",
+        );
+        assert!(!any_fail(&checks), "{checks:?}");
+        let reach = checks
+            .iter()
+            .find(|c| c.name == "egress/socks-reach")
+            .expect("socks-reach 存在");
+        assert_eq!(reach.status, Status::Ok);
+        let geo = checks
+            .iter()
+            .find(|c| c.name == "egress/socks-geo")
+            .expect("socks-geo 存在");
+        assert_eq!(geo.status, Status::Ok, "{}", geo.detail);
+        assert!(geo.detail.contains("Asia/Singapore"));
+        let worker = checks
+            .iter()
+            .find(|c| c.name == "provider/worker")
+            .expect("provider/worker 存在");
+        assert_eq!(worker.status, Status::Ok, "{}", worker.detail);
+    }
+
+    #[test]
+    fn socks_egress_geo_mismatch_fails_and_unreachable_geo_warns() {
+        let mut m = default_manifest();
+        m.push(worker_entry());
+        let toml = "egress = 'socks5://127.0.0.1:7891'\nlocale.tz = 'Asia/Tokyo'";
+        let sys = FakeSys {
+            manifest: Ok(Some(m.clone())),
+            socks_geo: Some(Ok(
+                r#"{"timezone":"Asia/Singapore","countryCode":"SG"}"#.into(),
+            )),
+            ..Default::default()
+        };
+        let checks = socks_checks(&sys, toml);
+        let geo = checks.iter().find(|c| c.name == "egress/socks-geo").unwrap();
+        assert_eq!(geo.status, Status::Fail, "{}", geo.detail);
+        assert!(geo.detail.contains("≠ 声明 Asia/Tokyo"), "{}", geo.detail);
+        // 探测不可达 = Warn（advisory；verify P13 为权威）
+        let sys = FakeSys {
+            manifest: Ok(Some(m)),
+            socks_geo: None,
+            ..Default::default()
+        };
+        let checks = socks_checks(&sys, toml);
+        let geo = checks.iter().find(|c| c.name == "egress/socks-geo").unwrap();
+        assert_eq!(geo.status, Status::Warn, "{}", geo.detail);
+        assert!(!any_fail(&checks), "不可达 geo 只应 Warn：{checks:?}");
+    }
+
+    #[test]
+    fn socks_egress_unreachable_proxy_fails() {
+        let p: Profile = toml::from_str("egress = 'socks5://127.0.0.1:7891'").unwrap();
+        struct DeadResolve;
+        impl SysInspect for DeadResolve {
+            fn read_sysctl(&self, _: &str) -> io::Result<String> {
+                Err(io::Error::new(io::ErrorKind::NotFound, "n/a"))
+            }
+            fn iface_exists(&self, _: &str) -> bool {
+                true
+            }
+            fn iface_has_route(&self, _: &str) -> bool {
+                true
+            }
+            fn iface_has_default_route(&self, _: &str) -> bool {
+                true
+            }
+            fn path_exists(&self, _: &Path) -> bool {
+                true
+            }
+            fn path_executable(&self, _: &Path) -> bool {
+                true
+            }
+            fn which(&self, _: &str) -> Option<PathBuf> {
+                None
+            }
+            fn command_output(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn provider_version(&self, _: &Path) -> Option<String> {
+                None
+            }
+            fn locale_available(&self, _: &str) -> bool {
+                true
+            }
+            fn resolve_connect(&self, _: &str, _: u16) -> Result<(), String> {
+                Err("connection refused".into())
+            }
+            fn socks_http_get(&self, _: &str, _: u16, _: &str, _: &str) -> Result<String, String> {
+                Err("unreachable".into())
+            }
+            fn manifest_state(&self) -> Result<Option<Vec<crate::manifest::Entry>>, String> {
+                Ok(Some(default_manifest()))
+            }
+        }
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "sg",
+            &p,
+            &DeadResolve,
+        );
+        let reach = checks
+            .iter()
+            .find(|c| c.name == "egress/socks-reach")
+            .expect("socks-reach 存在");
+        assert_eq!(reach.status, Status::Fail, "{}", reach.detail);
+        assert!(reach.detail.contains("绝不回落"), "{}", reach.detail);
+        assert!(any_fail(&checks));
+    }
+
+    #[test]
+    fn socks_egress_missing_worker_entry_fails() {
+        let sys = FakeSys::default(); // 清单只有 pasta 条目
+        let checks = socks_checks(&sys, "egress = 'socks5://127.0.0.1:7891'");
+        let worker = checks
+            .iter()
+            .find(|c| c.name == "provider/worker")
+            .expect("provider/worker 存在");
+        assert_eq!(worker.status, Status::Fail, "{}", worker.detail);
+        assert!(worker.detail.contains("setup"), "{}", worker.detail);
+        assert!(any_fail(&checks));
     }
 }

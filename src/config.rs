@@ -31,6 +31,60 @@ impl std::fmt::Display for NetGateway {
     }
 }
 
+/// egress 引用（D4 修订两形态，工单 16）：
+/// - `if:<接口名>`（默认形态）：pasta 直接以该接口为 outbound，出口 = 宿主出口；
+/// - `socks5://<host>:<port>`：会话根仍是 pasta（outbound = 宿主默认路由接口），
+///   netns 内由 tun2proxy worker（tun1）把全部出口流量送经宿主 SOCKS5
+///   （mihomo mixed-port 类）。择型证据：/tmp/iso-cc-exp16/REPORT.md（阶段 A 实测
+///   组合成立，embedded netstack 降级为远期）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Egress {
+    If(String),
+    Socks5 { host: String, port: u16 },
+}
+
+/// 解析 `socks5://<host>:<port>`（fail-loud：userinfo/缺端口/空 host/方括号外
+/// 的裸 v6 一律拒绝；`[v6]:port` 括号形态支持）。返回 (host, port)。
+pub fn parse_socks5_url(url: &str) -> Result<(String, u16), ConfigError> {
+    let rest = url
+        .strip_prefix("socks5://")
+        .ok_or_else(|| ConfigError::EgressShape(url.to_string()))?;
+    if rest.is_empty() {
+        return Err(ConfigError::EgressShape(url.to_string()));
+    }
+    // IPv6 字面量括号形态：socks5://[::1]:1080
+    if let Some(v6) = rest.strip_prefix('[') {
+        let (host, port) = v6
+            .split_once("]:")
+            .ok_or_else(|| ConfigError::EgressShape(url.to_string()))?;
+        let port: u16 = port
+            .parse()
+            .map_err(|_| ConfigError::EgressShape(url.to_string()))?;
+        if host.is_empty() {
+            return Err(ConfigError::EgressShape(url.to_string()));
+        }
+        return Ok((host.to_string(), port));
+    }
+    if rest.contains('[') || rest.contains(']') {
+        return Err(ConfigError::EgressShape(url.to_string()));
+    }
+    // userinfo（user:pass@host:port）v1 不支持：出现 '@' 即拒绝（fail-loud，绝不静默丢弃凭据）。
+    if rest.contains('@') {
+        return Err(ConfigError::EgressShape(url.to_string()));
+    }
+    let (host, port) = rest
+        .rsplit_once(':')
+        .ok_or_else(|| ConfigError::EgressShape(url.to_string()))?;
+    if host.is_empty() || host.contains(':') {
+        // 裸 v6（多个 ':' 无括号）无法与 host:port 二义区分 → 拒绝，要求括号形态
+        return Err(ConfigError::EgressShape(url.to_string()));
+    }
+    let port: u16 = port
+        .parse()
+        .map_err(|_| ConfigError::EgressShape(url.to_string()))?;
+    Ok((host.to_string(), port))
+}
+
 /// 顶层配置：`~/.config/iso-cc/config.toml`（全局）+ 可选项目级 `.iso-cc.toml` 覆盖。
 ///
 /// 纪律（ADR 0008 / pm-spec 教训）：版本号与结构由本文件唯一裁决；
@@ -47,7 +101,7 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
-    /// 出口引用，v1 契约仅 `if:<接口名>`（D4）。
+    /// 出口引用（D4 修订两形态）：`if:<接口名>`（默认）| `socks5://<host>:<port>`。
     pub egress: String,
     #[serde(default)]
     pub locale: Locale,
@@ -144,7 +198,16 @@ pub struct Agent {
 }
 
 impl Profile {
-    /// 解析 egress 引用。v1 仅 `if:<name>`（D4：隧道侧自出 TUN）。
+    /// 解析 egress 引用（D4 修订：`if:<name>` | `socks5://<host>:<port>` 两形态）。
+    pub fn egress(&self) -> Result<Egress, ConfigError> {
+        if self.egress.starts_with("socks5://") {
+            let (host, port) = parse_socks5_url(&self.egress)?;
+            return Ok(Egress::Socks5 { host, port });
+        }
+        self.egress_iface().map(|name| Egress::If(name.to_string()))
+    }
+
+    /// `if:` 形态专用访问器（socks 形态 = 配置错误：该调用点只接受接口引用）。
     pub fn egress_iface(&self) -> Result<&str, ConfigError> {
         self.egress
             .strip_prefix("if:")
@@ -180,8 +243,16 @@ impl Profile {
     /// 结构校验：返回错误清单（空 = 通过）。宿主事实检查归 doctor，不在这里。
     pub fn validate(&self) -> Vec<String> {
         let mut errs = Vec::new();
-        if let Err(e) = self.egress_iface() {
+        if let Err(e) = self.egress() {
             errs.push(e.to_string());
+        }
+        if matches!(self.egress(), Ok(Egress::Socks5 { .. }))
+            && self.gateway() == NetGateway::Slirp4netns
+        {
+            errs.push(
+                "socks5 egress 仅支持 net.gateway=pasta（slirp 回退组合未经工单 16 实测，fail-loud 拒绝落地）"
+                    .to_string(),
+            );
         }
         for r in &self.redirect {
             if !r.contains('=') || r.split('=').count() != 2 {
@@ -208,7 +279,7 @@ pub enum ConfigError {
     },
     #[error("config.version 必须为 1，当前为 {0}")]
     Version(u8),
-    #[error("egress 契约仅支持 `if:<接口名>`，收到 {0:?}")]
+    #[error("egress 契约支持 `if:<接口名>` 或 `socks5://<host>:<port>`，收到 {0:?}")]
     EgressShape(String),
     #[error("未找到任何配置（查过 {paths}）；需要至少一个 profile")]
     NoConfig { paths: String },
@@ -447,6 +518,70 @@ agent.command = "claude"
         let cfg: Config = toml::from_str("version = 1\n[profile.x]\negress = 'socks:1'").unwrap();
         let errs = cfg.profile.get("x").unwrap().validate();
         assert!(errs.iter().any(|e| e.contains("if:")), "{errs:?}");
+    }
+
+    #[test]
+    fn socks5_egress_parses_host_and_port() {
+        let cfg: Config =
+            toml::from_str("version = 1\n[profile.x]\negress = 'socks5://127.0.0.1:7891'").unwrap();
+        let p = cfg.profile.get("x").unwrap();
+        assert!(p.validate().is_empty());
+        assert_eq!(
+            p.egress().unwrap(),
+            Egress::Socks5 {
+                host: "127.0.0.1".into(),
+                port: 7891
+            }
+        );
+    }
+
+    #[test]
+    fn socks5_egress_with_slirp_gateway_rejected() {
+        let cfg: Config = toml::from_str(
+            "version = 1\n[profile.x]\negress = 'socks5://127.0.0.1:7891'\nnet.gateway = 'slirp4netns'",
+        )
+        .unwrap();
+        let errs = cfg.profile.get("x").unwrap().validate();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("仅支持 net.gateway=pasta")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn socks6_bracket_form_parses() {
+        let cfg: Config =
+            toml::from_str("version = 1\n[profile.x]\negress = 'socks5://[::1]:1080'").unwrap();
+        assert_eq!(
+            cfg.profile["x"].egress().unwrap(),
+            Egress::Socks5 {
+                host: "::1".into(),
+                port: 1080
+            }
+        );
+    }
+
+    #[test]
+    fn socks5_malformed_urls_rejected() {
+        for bad in [
+            "socks5://",             // 空
+            "socks5://host",         // 缺端口
+            "socks5://host:port",    // 端口非数字
+            "socks5://host:99999",   // 端口越界
+            "socks5://:7891",        // 空 host
+            "socks5://user@host:1",  // userinfo v1 不支持（凭据不静默丢弃）
+            "socks5://::1:7891",     // 裸 v6（二义）必须括号形态
+            "socks5://[::1]",        // 括号缺端口
+        ] {
+            let cfg: Config =
+                toml::from_str(&format!("version = 1\n[profile.x]\negress = {bad:?}")).unwrap();
+            let errs = cfg.profile.get("x").unwrap().validate();
+            assert!(
+                errs.iter().any(|e| e.contains("socks5://<host>:<port>")),
+                "{bad:?} 应被拒绝：{errs:?}"
+            );
+        }
     }
 
     #[test]

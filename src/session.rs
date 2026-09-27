@@ -11,7 +11,7 @@ use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// bootstrap plan（设计稿 §1.4 参数面）：同二进制 serde 往返 + `deny_unknown_fields`
 /// （#5 fail-loud）；argv 传递 = 子进程交接零状态（无临时文件）。
@@ -23,6 +23,20 @@ pub struct BootstrapPlan {
     pub binds: Vec<(String, String)>,
     pub iface: String,
     pub timeout_ms: u64,
+    /// socks5 形态（工单 16）：Some = bootstrap 在 mountns 就绪后 spawn tun2proxy
+    /// worker 并等 tun1；None = `if:` 形态（零改动）。`#[serde(default)]` 保持
+    /// 旧 JSON 兼容（deny_unknown_fields 只拒未知键，不要求新键存在）。
+    #[serde(default)]
+    pub socks: Option<SocksPlan>,
+}
+
+/// socks worker 计划：proxy host 运行时在 ns 内经 netlink 发现（tap0 默认路由网关
+/// = pasta 网关地址 = 宿主 loopback 映射），计划只携带端口与 tun 名。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SocksPlan {
+    pub port: u16,
+    pub tun: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,13 +106,42 @@ pub enum ChildMode {
     Probe,
 }
 
+/// egress fail-loud 预检（cmd_run 的 `--print-plan` 同样断言：计划必须可按所印执行；
+/// spawn 内部亦调用，幂等）。返回 (pasta outbound 接口, socks worker 计划)。
+///
+/// - `if:`：#12 撞名拒绝 + #3 sysfs UP 断言。
+/// - `socks5://`：outbound = 宿主默认路由接口（#3）；proxy 端口宿主 TCP 可达
+///   （#B 预检，R8：绝不回落）。
+pub fn egress_preflight(profile: &Profile) -> anyhow::Result<(String, Option<SocksPlan>)> {
+    match profile.egress().map_err(anyhow::Error::from)? {
+        crate::config::Egress::If(name) => {
+            provider::validate_egress_iface(&name)?;
+            provider::host_iface_up(&name)?;
+            Ok((name, None))
+        }
+        crate::config::Egress::Socks5 { host, port } => {
+            if profile.gateway() == NetGateway::Slirp4netns {
+                bail!(
+                    "socks5 egress 仅支持 net.gateway=pasta（slirp 回退组合未经工单 16 实测，fail-loud 拒绝落地）"
+                );
+            }
+            let iface = provider::host_default_iface()?;
+            provider::host_iface_up(&iface)?;
+            provider::socks::host_preflight(&host, port)?;
+            Ok((
+                iface,
+                Some(SocksPlan {
+                    port,
+                    tun: provider::socks::TUN_IFNAME.to_string(),
+                }),
+            ))
+        }
+    }
+}
+
 /// 会话入口：egress fail-loud 断言 → 会话资产（sessions/<id>/）→ 网关 provider 化 spawn。
 pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::Result<Session> {
-    let egress_iface = profile.egress_iface()?.to_string();
-    // fail-loud #12：`-I` 撞名类 egress（lo/tap0）直接拒绝
-    provider::validate_egress_iface(&egress_iface)?;
-    // fail-loud #3：宿主 egress 接口存在且 UP（sysfs，spawn 前断言；R8 绝不回落）
-    provider::host_iface_up(&egress_iface)?;
+    let (egress_iface, socks_plan) = egress_preflight(profile)?;
     // L2（设计稿 §4-L2）：会话树建立前自设 subreaper——收编循环的 reparent 前提
     // （原语 = ns::set_child_subreaper，票 14 归位）。
     ns::set_child_subreaper().map_err(|e| anyhow!("PR_SET_CHILD_SUBREAPER 失败: {e}"))?;
@@ -166,6 +209,7 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
     };
 
     // bootstrap plan（§1.4）：mode 位承载 provider 差异（§1.2 被否双模式并存的收敛点）
+    let has_socks = socks_plan.is_some();
     let plan = BootstrapPlan {
         mode: match gateway {
             NetGateway::Pasta => BootstrapMode::Mountns,
@@ -178,6 +222,7 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
             .collect(),
         iface: provider::NS_IFNAME.to_string(),
         timeout_ms: 15_000,
+        socks: socks_plan,
     };
 
     let inner: Vec<OsString> = match &mode {
@@ -206,7 +251,15 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
         exec: exec_channel,
     };
     match gateway {
-        NetGateway::Pasta => spawn_pasta(ctx, profile, &egress_iface, dns, inner),
+        // socks 形态：pasta outbound 省略（自动检测宿主默认路由接口；显式
+        // `--outbound-if4` 会破坏 map-host-loopback 网关地址映射，工单 16 取证）。
+        NetGateway::Pasta => spawn_pasta(
+            ctx,
+            profile,
+            if has_socks { None } else { Some(&egress_iface) },
+            dns,
+            inner,
+        ),
         NetGateway::Slirp4netns => spawn_slirp(ctx, profile, inner),
     }
 }
@@ -225,7 +278,7 @@ struct SpawnCtx<'a> {
 fn spawn_pasta(
     mut ctx: SpawnCtx<'_>,
     profile: &Profile,
-    egress_iface: &str,
+    egress_iface: Option<&str>,
     dns: Ipv4Addr,
     inner: Vec<OsString>,
 ) -> anyhow::Result<Session> {
@@ -294,8 +347,9 @@ fn spawn_pasta(
     }
 
     eprintln!(
-        "[iso-cc] session {session_id}: root=pasta(pid={}) egress-iface={egress_iface} dns={dns} scope={:?} exec.bash={:?} assets={}",
+        "[iso-cc] session {session_id}: root=pasta(pid={}) outbound-iface={} dns={dns} scope={:?} exec.bash={:?} assets={}",
         pasta.id(),
+        egress_iface.unwrap_or("<auto: host default-route>"),
         profile.scope(),
         profile.exec_bash(),
         sess_dir.display()
@@ -415,7 +469,7 @@ fn enter_mountns_inband(plan: &BootstrapPlan) -> anyhow::Result<()> {
     ns::enter_mountns(&binds, 0).map_err(|e| anyhow!("mountns 装配（pasta 之下）失败: {e}"))
 }
 
-/// 等网关 tap 就绪（provider 无关）→ exec 真实命令。
+/// 等网关 tap 就绪（provider 无关；socks 形态再等 worker tun1）→ exec 真实命令。
 /// 两 provider 均 self-config（pasta `--config-net` / slirp `-c`，§3.1）：
 /// 原 `ip addr add`/`ip route add`/`ip link set tap0 up` 配网命令整体删除。
 /// 票 12：ipv6_off → /proc/sys 直写（§3.3）→ netlink 就绪等待（§3.2）→ exec；
@@ -437,12 +491,90 @@ fn bootstrap_exec(
         netcfg::disable_ipv6()?;
     }
     netcfg::wait_ready(&plan.iface, Duration::from_millis(plan.timeout_ms))?;
+    if let Some(socks) = &plan.socks {
+        spawn_socks_worker_and_wait(plan, socks, session_id)?;
+    }
     let mut c = Command::new(prog);
     for a in &command[1..] {
         c.arg(a);
     }
     let err = c.exec();
     Err(anyhow!("exec 失败: {err}"))
+}
+
+/// socks 分支（工单 16）：netns 内 spawn tun2proxy worker（标记 + PDEATHSIG→本进程）
+/// → netlink 等 tun1 就绪。顺序 = tap0 就绪（网关地址存在的前提）→ 发现网关 →
+/// worker → tun1 → exec cc。worker 死 = tun1 无读者 = 协议黑洞（fail-closed，R8 同构，
+/// 绝不回落直连）；spawn/就绪失败 = fail-loud（#8 同规：文案含步骤/对象/日志指针）。
+fn spawn_socks_worker_and_wait(
+    plan: &BootstrapPlan,
+    socks: &SocksPlan,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let bin = provider::pinned_bin(provider::socks::WORKER_KEY)?;
+    // worker 日志 → sessions/<id>/worker.log（对齐 slirp 的 gateway.log 取证形态）
+    let log_file = session_dir(session_id)?.join("worker.log");
+    let log = std::fs::File::create(&log_file)
+        .with_context(|| format!("创建 {}", log_file.display()))?;
+    let gw = netcfg::default_gateway(&plan.iface)
+        .map_err(|e| anyhow!("worker 代理地址发现失败（{e}）；tap0 未就绪或无默认路由"))?;
+    let mut c = Command::new(&bin);
+    for a in provider::socks::worker_args(gw, socks.port) {
+        c.arg(a);
+    }
+    // worker 标记（env 键可读：非 dumpable-0 二进制，list/sweep 归 cc 树成员，
+    // 其 netns inode 计入活跃集——会话归属判定零改动）
+    c.env("ISO_CC_SESSION", session_id);
+    c.stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone().context("worker.log 复制句柄")?))
+        .stderr(Stdio::from(log));
+    // PDEATHSIG→bootstrap：exec cc 后父进程存续（exec 不触发信号），cc 死亡即内核
+    // 击杀 worker——worker 存活 ⊆ 会话存活；tun1/路由随 netns 消亡回收，零 residue。
+    let expected_ppid = std::process::id();
+    ns::install_pre_exec(&mut c, move || {
+        ns::set_pdeathsig_verified(libc::SIGKILL, expected_ppid)
+    });
+    let mut worker = c
+        .spawn()
+        .with_context(|| format!("spawn tun2proxy worker（{}）", bin.display()))?;
+    let guard = KillGuard::arm(worker.id());
+
+    // 就绪等待（带 worker 早期退出检测：tun1 永不就绪时给 worker.log 尾部而非裸超时）
+    let deadline = Instant::now() + Duration::from_millis(plan.timeout_ms);
+    loop {
+        match netcfg::wait_tun_ready(&socks.tun, Duration::from_millis(250)) {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(anyhow!("tun1 就绪断言失败（netlink）: {e}")),
+        }
+        if let Some(status) = worker.try_wait().context("try_wait tun2proxy worker")? {
+            let tail = tail_lines(&log_file, 40);
+            bail!(
+                "tun2proxy worker 早期退出（status={status}，fail-loud #B）：tun1 未就绪；R8：绝不回落；{} 末尾：\n{tail}",
+                log_file.display()
+            );
+        }
+        if Instant::now() >= deadline {
+            let tail = tail_lines(&log_file, 40);
+            bail!(
+                "#8 tun1 就绪等待超时（{}ms）：worker 已 spawn 但 tun1/默认路由未出现；R8：绝不回落；{} 末尾：\n{tail}",
+                plan.timeout_ms,
+                log_file.display()
+            );
+        }
+    }
+    guard.disarm();
+    let worker_pid = worker.id();
+    // worker 句柄有意丢弃（Child drop 不杀进程）：生命周期由 PDEATHSIG→bootstrap(cc)
+    // 结构性保证，Session 不持 worker。
+    drop(worker);
+    eprintln!(
+        "[iso-cc] socks worker: tun2proxy(pid={worker_pid}) tun={} proxy=socks5://{gw}:{} log={}",
+        socks.tun,
+        socks.port,
+        log_file.display()
+    );
+    Ok(())
 }
 
 impl Session {
@@ -579,6 +711,7 @@ mod tests {
             binds: vec![("/a".into(), "/b".into())],
             iface: provider::NS_IFNAME.into(),
             timeout_ms: 15_000,
+            socks: None,
         };
         let json = serde_json::to_string(&plan).unwrap();
         let back: BootstrapPlan = serde_json::from_str(&json).unwrap();
@@ -611,8 +744,58 @@ mod tests {
             binds: vec![],
             iface: provider::NS_IFNAME.into(),
             timeout_ms: 15_000,
+            socks: None,
         };
         let json = serde_json::to_string(&plan).unwrap();
         assert!(json.contains("\"mode\":\"selfmap\""), "{json}");
+    }
+
+    #[test]
+    fn socks_plan_roundtrip_and_old_json_compat() {
+        let plan = BootstrapPlan {
+            mode: BootstrapMode::Mountns,
+            ipv6_off: true,
+            binds: vec![],
+            iface: provider::NS_IFNAME.into(),
+            timeout_ms: 15_000,
+            socks: Some(SocksPlan {
+                port: 7891,
+                tun: provider::socks::TUN_IFNAME.into(),
+            }),
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(json.contains("\"socks\":{\"port\":7891,\"tun\":\"tun1\"}"), "{json}");
+        let back: BootstrapPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, plan);
+        // 旧 plan JSON（无 socks 键）仍可解析：serde(default) 只补缺，不拒旧态
+        let old: BootstrapPlan = serde_json::from_str(
+            r#"{"mode":"mountns","ipv6_off":true,"binds":[],"iface":"tap0","timeout_ms":15000}"#,
+        )
+        .unwrap();
+        assert_eq!(old.socks, None);
+        // socks 子对象未知键照样拒绝（#5 同规）
+        let bad = serde_json::from_str::<BootstrapPlan>(
+            r#"{"mode":"mountns","ipv6_off":false,"binds":[],"iface":"tap0","timeout_ms":15000,"socks":{"port":1,"tun":"tun1","x":2}}"#,
+        );
+        assert!(bad.is_err(), "socks 子对象未知键必须拒绝");
+    }
+
+    #[test]
+    fn egress_preflight_socks_plan_shape() {
+        // 结构面：socks 形态计划 = {port, tun1}（宿主事实检查归 spawn/doctor，这里不触网）。
+        // host_preflight 对本机必有监听端口不可假设 → 只断言计划构造纯函数面（provider::socks）。
+        let p: Profile = toml::from_str("egress = 'socks5://127.0.0.1:7891'").unwrap();
+        match p.egress().unwrap() {
+            crate::config::Egress::Socks5 { host, port } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 7891);
+                let plan = SocksPlan {
+                    port,
+                    tun: provider::socks::TUN_IFNAME.into(),
+                };
+                assert_eq!(plan.tun, "tun1");
+            }
+            other => panic!("应为 socks 形态: {other:?}"),
+        }
     }
 }

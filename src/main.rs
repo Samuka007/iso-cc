@@ -222,10 +222,10 @@ fn cmd_run(
         eprintln!("note: {w}");
     }
     let (name, prof) = resolve(&cfg, &profile)?;
-    // fail-loud #12（config 期：-I 撞名类 egress 直接拒绝）+ #3（宿主 sysfs，spawn 前断言，
-    // R8 绝不回落）。--print-plan 同样断言：计划必须可按所印执行。
-    provider::validate_egress_iface(prof.egress_iface()?)?;
-    provider::host_iface_up(prof.egress_iface()?)?;
+    // egress 预检（工单 16 两形态）：`if:` → #12 撞名拒绝 + #3 sysfs UP；
+    // `socks5://` → #B proxy 可达 + 宿主默认路由接口 #3。R8 绝不回落。
+    // --print-plan 同样断言：计划必须可按所印执行。
+    let _ = session::egress_preflight(&prof)?;
     let plan = plan::plan_lines(&name, &prof, command.first());
     if print_plan || command.is_empty() {
         for l in plan {

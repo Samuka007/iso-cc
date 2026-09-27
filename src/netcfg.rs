@@ -8,11 +8,12 @@
 //! - 被否 slirp `-r/--ready-fd` 旁证线（§3.2）：破坏 provider 无关性，pasta 无 ready-fd。
 
 use std::io;
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_DUMP, NLM_F_REQUEST};
 use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
-use netlink_packet_route::route::{RouteAttribute, RouteMessage};
+use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
 use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
 use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
 
@@ -125,6 +126,144 @@ fn timeout_error(iface: &str, timeout: Duration, step: &str) -> io::Error {
     )
 }
 
+/// socks worker 代理地址发现（工单 16）：iface 默认路由的 v4 网关地址。
+/// netns 内 ground truth 走 netlink dump（sysfs 为宿主视图伪影，09 取证 #5）；
+/// 该地址经 pasta `--map-host-loopback` 默认映射宿主 loopback，即 worker 的
+/// `socks5://<gw>:<port>` 代理地址。前置条件 = [`wait_ready`] 同 iface 已就绪
+/// （v4 默认路由存在为 dump 断言的前提）。
+pub fn default_gateway(iface: &str) -> io::Result<Ipv4Addr> {
+    let mut sock = Socket::new(NETLINK_ROUTE)?;
+    sock.bind(&SocketAddr::new(0, 0))?;
+    let mut ifindex = None;
+    dump_once(
+        &sock,
+        RouteNetlinkMessage::GetLink(LinkMessage::default()),
+        1,
+        |msg| {
+            if let RouteNetlinkMessage::NewLink(link) = msg {
+                if iface_of(&link.attributes).as_deref() == Some(iface) {
+                    ifindex = Some(link.header.index);
+                    return true;
+                }
+            }
+            false
+        },
+    )?;
+    let idx = ifindex.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("#B netlink 无 iface={iface}（worker 代理地址不可得）"),
+        )
+    })?;
+    let mut gw = None;
+    dump_once(
+        &sock,
+        RouteNetlinkMessage::GetRoute(RouteMessage::default()),
+        2,
+        |msg| {
+            if let RouteNetlinkMessage::NewRoute(route) = msg {
+                if let Some(g) = gateway_of(&route, idx) {
+                    gw = Some(g);
+                    return true;
+                }
+            }
+            false
+        },
+    )?;
+    gw.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("#B iface={iface} 默认路由无 v4 网关属性（worker socks5 地址不可得）"),
+        )
+    })
+}
+
+/// socks worker tun 就绪等待（工单 16）：tun2proxy `-s` 以 0.0.0.0/1 + 128.0.0.0/1
+/// 双 halving 路由承载默认路径（真 0/0 恒留在 tap0 网关上）——[`wait_ready`] 的
+/// 「v4 默认路由」断言在此恒假。断言改为：① iface 存在且 UP ② 存在 oif=iface 的
+/// prefixlen∈{0,1} 路由（halving 或真默认，两者取其一即可）。
+pub fn wait_tun_ready(iface: &str, timeout: Duration) -> io::Result<()> {
+    let mut sock = Socket::new(NETLINK_ROUTE)?;
+    sock.bind(&SocketAddr::new(0, 0))?;
+    let deadline = Instant::now() + timeout;
+    let mut seq: u32 = 1;
+    let mut last_step = "RTM_GETLINK（iface 存在 + IFF_UP）";
+    loop {
+        let mut ifindex = None;
+        dump_once(
+            &sock,
+            RouteNetlinkMessage::GetLink(LinkMessage::default()),
+            seq,
+            |msg| {
+                if let RouteNetlinkMessage::NewLink(link) = msg {
+                    if iface_of(&link.attributes).as_deref() == Some(iface)
+                        && link.header.flags.contains(LinkFlags::Up)
+                    {
+                        ifindex = Some(link.header.index);
+                        return true;
+                    }
+                }
+                false
+            },
+        )?;
+        seq = seq.wrapping_add(1);
+        if let Some(idx) = ifindex {
+            last_step = "RTM_GETROUTE（oif=iface 的 halving/默认路由）";
+            let mut ready = false;
+            dump_once(
+                &sock,
+                RouteNetlinkMessage::GetRoute(RouteMessage::default()),
+                seq,
+                |msg| {
+                    if let RouteNetlinkMessage::NewRoute(route) = msg {
+                        if route.header.address_family == AddressFamily::Inet
+                            && matches!(
+                                route.header.destination_prefix_length,
+                                0 | 1
+                            )
+                            && route
+                                .attributes
+                                .iter()
+                                .any(|a| matches!(a, RouteAttribute::Oif(o) if *o == idx))
+                        {
+                            ready = true;
+                            return true;
+                        }
+                    }
+                    false
+                },
+            )?;
+            seq = seq.wrapping_add(1);
+            if ready {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(timeout_error(iface, timeout, last_step));
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// 纯判定核心（可单测）：v4 默认路由（AF_INET + prefixlen=0 + oif）的 Gateway 属性。
+fn gateway_of(route: &RouteMessage, oif: u32) -> Option<Ipv4Addr> {
+    if route.header.address_family != AddressFamily::Inet
+        || route.header.destination_prefix_length != 0
+    {
+        return None;
+    }
+    let mut gw = None;
+    let mut oif_ok = false;
+    for a in &route.attributes {
+        match a {
+            RouteAttribute::Oif(o) if *o == oif => oif_ok = true,
+            RouteAttribute::Gateway(RouteAddress::Inet(ip)) => gw = Some(ip),
+            _ => {}
+        }
+    }
+    if oif_ok { gw.copied() } else { None }
+}
+
 /// 发送一个 dump 请求（REQUEST|DUMP）并收取回复直至 NLMSG_DONE。
 /// `visit` 命中即停止匹配（但消费完整个 dump，防旧消息污染下一次轮询）。
 /// 内核 NACK（非零 errno）fail-loud；解析畸形（长度非法）fail-loud。
@@ -214,5 +353,24 @@ mod tests {
         assert!(msg.contains("#7"), "{msg}");
         assert!(msg.contains("/proc/iso-cc-nonexistent/disable_ipv6"), "{msg}");
         assert!(msg.contains("os error"), "{msg}");
+    }
+
+    /// 工单 16：gateway_of 只认 v4 默认路由 + oif 匹配，Gateway 属性解出 Ipv4Addr。
+    #[test]
+    fn gateway_of_extracts_v4_gateway_of_matching_oif() {
+        let mut route = RouteMessage::default();
+        route.header.address_family = AddressFamily::Inet;
+        route.header.destination_prefix_length = 0;
+        route.attributes = vec![
+            RouteAttribute::Oif(7),
+            RouteAttribute::Gateway(RouteAddress::Inet(Ipv4Addr::new(172, 27, 0, 1))),
+        ];
+        assert_eq!(gateway_of(&route, 7), Some(Ipv4Addr::new(172, 27, 0, 1)));
+        assert_eq!(gateway_of(&route, 9), None);
+        route.header.destination_prefix_length = 24;
+        assert_eq!(gateway_of(&route, 7), None);
+        route.header.address_family = AddressFamily::Inet6;
+        route.header.destination_prefix_length = 0;
+        assert_eq!(gateway_of(&route, 7), None);
     }
 }
