@@ -39,3 +39,9 @@
 ## 边界
 
 - 订阅/私有信息不入仓库；真凭据只在用户 secrets；`.scratch/**`、`docs/**` 只读；不 git（aptline 仓库的 git init 允许——它是新独立仓库）
+
+## 实测补记（2026-09-27）：S3 凭据无法从 CF API token 派生
+
+- `POST /accounts/{account}/tokens` 可程序化创建 R2 权限的 CF API token（Workers R2 Storage Bucket Item Write，scope=bucket），但 **(token id, token value) ≠ S3 SigV4 凭据**：rclone SigV4 实测 `SignatureDoesNotMatch`；GET token 对象无 accessKey 字段
+- temp-access-credentials API 依赖**已存在的 R2 parent token**（parent_access_key_id + secret），cfat_ CF token 不能当 parent → 鸡生蛋
+- **结论**：R2 S3 凭据（Access Key ID/Secret）只能 Dashboard 一次性创建（R2 → Manage API Tokens → Create API Token，Object Read & Write，scope bucket apt）。此后可用该 parent 派生 temp creds 供 CI 每次发版铸造短期凭据（密钥不常驻 CI）
