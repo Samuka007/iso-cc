@@ -44,4 +44,5 @@
 
 - `POST /accounts/{account}/tokens` 可程序化创建 R2 权限的 CF API token（Workers R2 Storage Bucket Item Write，scope=bucket），但 **(token id, token value) ≠ S3 SigV4 凭据**：rclone SigV4 实测 `SignatureDoesNotMatch`；GET token 对象无 accessKey 字段
 - temp-access-credentials API 依赖**已存在的 R2 parent token**（parent_access_key_id + secret），cfat_ CF token 不能当 parent → 鸡生蛋
-- **结论**：R2 S3 凭据（Access Key ID/Secret）只能 Dashboard 一次性创建（R2 → Manage API Tokens → Create API Token，Object Read & Write，scope bucket apt）。此后可用该 parent 派生 temp creds 供 CI 每次发版铸造短期凭据（密钥不常驻 CI）
+- **结论修正（同日，官方文档实锤 + 实测通过）**：/r2/api/tokens/ "Get S3 API credentials from an API token" 明确——**Access Key ID = token id；Secret Access Key = SHA-256 hex(token value)**。此前失败因用了原始 value；修正后 rclone SigV4 实测通过（lsf rc=0）。**全自动达成，零 Dashboard 点击**。发布器凭据落盘 secrets/r2-s3-credentials（0600，含 raw value 供 temp creds 铸造）+ secrets/rclone.conf
+- **上线实证**：apt.samuka007.com 已绑定 bucket apt；KEY.gpg/Packages/InRelease 全部 200，InRelease 验签指纹 F47CF323…4331 吻合
