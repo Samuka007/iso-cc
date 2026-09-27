@@ -2,7 +2,14 @@
 
 **What to build:** 移除票 20 的 `net.mcp_fallback` socat 兜底机制（用户裁决 2026-09-27：给时序错位打补丁不优雅；正确契约 = **MCP server 先于 cc 启动，否则重启 cc 是合理操作**）。
 
-**Blocked by:** 21（完成中）　**Owner:** 待派
+**Blocked by:** 21（已完成）　**Owner:** lane-fallback-remove（完成）
+**Status:** done（2026-09-27，parent 亲验通过）
+
+## Answer（PM 落）
+
+- 四锚全绿 + parent 复跑：nextest 141/141；旧配置 `net.mcp_fallback` → `unknown field` fail-loud（亲验）；原生镜像端口 P-MCP 照绿、快照缺口端口 → 红 + 指引「先启动 MCP server 或重启 cc」；mark SKIP 不变；doctor 文案统一无兜底分支
+- BREAKING：旧配置含 net.mcp_fallback 键将拒绝解析——CHANGELOG.md 已建并记录（parent 裁决落地票面 #2）
+- 删除面：BootstrapPlan.mcp_fallback / bootstrap 调用点 / mcp_gap_fallback / spawn_socat_forwarder / loopback_tcp_reachable / EADDRINUSE 探测
 
 ## Specification
 

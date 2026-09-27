@@ -337,12 +337,9 @@ pub fn run(declared_tz: &str, allow_under: &[PathBuf]) -> Vec<Probe> {
                     )
                     .is_ok();
                 let (verdict, detail) = if reachable {
-                    mcp_classify(true, None)
+                    mcp_classify(true)
                 } else {
-                    // connect 失败 → bind 探测二分缺口语义（真缺口 vs 会话内占用）
-                    let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-                        .is_err();
-                    mcp_classify(false, Some(held))
+                    mcp_classify(false)
                 };
                 out.push(Probe::new(
                     &format!("P-MCP/loopback:{port}"),
@@ -419,31 +416,21 @@ pub fn any_fail(probes: &[Probe]) -> bool {
     probes.iter().any(|p| p.verdict == Verdict::Fail)
 }
 
-/// P-MCP 判定核（纯函数，票 20 单测锚）：connect 成功 = 绿（pasta 原生镜像或兜底
-/// 转发器任一承载，探活语义只看 connect）；connect 失败时以 bind 探测二分缺口语义
-/// ——端口空闲 = 真缺口（Fail：无镜像无兜底，票 20 fallback=false 红锚）；端口被
-/// 持有 = 会话内占用（Warn：本地服务优先，跳过红判——票 20 冲突语义 / exp19 §4
-/// EADDRINUSE）。
-fn mcp_classify(reachable: bool, held: Option<bool>) -> (Verdict, String) {
+/// P-MCP 判定核（纯函数，票 22 两态化）：connect 成功 = 绿（pasta 原生镜像透明
+/// 覆盖，探活语义只看 connect）；connect 失败 = 红 + 修复指引（先启动 MCP server
+/// 或重启 cc；快照边界见票 19 §3.2）。EADDRINUSE 二分随兜底删除（票 22 spec#4）。
+fn mcp_classify(reachable: bool) -> (Verdict, String) {
     if reachable {
         return (
             Verdict::Pass,
-            "connect 127.0.0.1 OK（原生镜像/兜底转发器任一承载；探活 = connect 成功）".into(),
+            "connect 127.0.0.1 OK（原生镜像透明覆盖；探活 = connect 成功）".into(),
         );
     }
-    match held {
-        Some(true) => (
-            Verdict::Warn,
-            "connect 失败但端口被持有（EADDRINUSE）：会话内服务/兜底转发器占用——本地服务优先，跳过红判（票 20 冲突语义）"
-                .into(),
-        ),
-        Some(false) => (
-            Verdict::Fail,
-            "connect 失败且端口空闲：宿主未监听且无兜底（快照缺口未补——net.mcp_fallback=false 或兜底失效）"
-                .into(),
-        ),
-        None => unreachable!("connect 失败必有 bind 探测结果"),
-    }
+    (
+        Verdict::Fail,
+        "connect 127.0.0.1 失败：宿主未监听该声明端口（快照缺口）——先启动 MCP server 或重启 cc（快照边界见票 19 §3.2）"
+            .into(),
+    )
 }
 
 pub fn render_human(probes: &[Probe]) -> String {
@@ -530,24 +517,17 @@ mod tests {
 
     #[test]
     fn p_mcp_classify_reachable_is_pass() {
-        let (v, d) = mcp_classify(true, None);
+        let (v, d) = mcp_classify(true);
         assert_eq!(v, Verdict::Pass);
         assert!(d.contains("connect 127.0.0.1 OK"), "{d}");
     }
 
     #[test]
-    fn p_mcp_classify_free_dead_port_is_fail() {
-        // 真缺口（端口空闲）：fallback=false 红锚（票 20 验收 2）
-        let (v, d) = mcp_classify(false, Some(false));
+    fn p_mcp_classify_unreachable_is_fail_with_repair_hint() {
+        // 票 22 两态化：不可达 = 红 + 修复指引（取代原兜底绿 / EADDRINUSE Warn）
+        let (v, d) = mcp_classify(false);
         assert_eq!(v, Verdict::Fail);
-        assert!(d.contains("快照缺口未补"), "{d}");
-    }
-
-    #[test]
-    fn p_mcp_classify_held_port_is_warn_session_conflict() {
-        // 会话自占端口（EADDRINUSE）：本地服务优先，跳过红判（票 20 验收 3）
-        let (v, d) = mcp_classify(false, Some(true));
-        assert_eq!(v, Verdict::Warn);
-        assert!(d.contains("本地服务优先"), "{d}");
+        assert!(d.contains("先启动 MCP server 或重启 cc"), "{d}");
+        assert!(d.contains("票 19 §3.2"), "{d}");
     }
 }

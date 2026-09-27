@@ -195,11 +195,6 @@ pub struct Net {
     /// 网关 DNS 转发地址（pasta `--dns-forward`；未声明 = 10.0.2.3）。
     #[serde(default)]
     pub dns: Option<Ipv4Addr>,
-    /// MCP loopback 快照缺口兜底轴（票 20）：true（默认）= bootstrap 期对声明
-    /// http/sse loopback MCP 端口探活，探活失败（pasta 镜像 = attach 时刻快照）
-    /// 起 socat 转发器补齐；false = 无兜底（缺口由 P-MCP 探针红显）。
-    #[serde(default)]
-    pub mcp_fallback: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -420,11 +415,6 @@ impl Profile {
         self.net.dns.unwrap_or(DEFAULT_DNS)
     }
 
-    /// 生效 MCP 快照缺口兜底（未声明 = true，票 20 默认开启）。
-    pub fn mcp_fallback(&self) -> bool {
-        self.net.mcp_fallback.unwrap_or(true)
-    }
-
     /// 结构校验：返回错误清单（空 = 通过）。宿主事实检查归 doctor，不在这里。
     pub fn validate(&self) -> Vec<String> {
         let mut errs = Vec::new();
@@ -487,12 +477,6 @@ impl Profile {
             if self.net.dns.is_some() {
                 errs.push(
                     "net.dns 是 netns DNS 转发地址；mark 引擎 DNS 元数据走宿主解析器（票 18 已登记例外，resolv bind 无 mountns 承载），轴不适用"
-                        .to_string(),
-                );
-            }
-            if self.net.mcp_fallback.is_some() {
-                errs.push(
-                    "net.mcp_fallback 是 netns 快照缺口兜底轴（票 20）；mark 引擎零 netns（127.0.0.1 天然直达宿主），机制不适用（票 19 §6）"
                         .to_string(),
                 );
             }
@@ -959,7 +943,6 @@ agent.command = "claude"
             "egress = 'if:w'\nnet.private = 'host'".to_string(),
             "egress = 'if:w'\nnet.gateway = 'pasta'".to_string(),
             "egress = 'if:w'\nnet.dns = '10.0.2.3'".to_string(),
-            "egress = 'if:w'\nnet.mcp_fallback = false".to_string(),
         ];
         for body in cases {
             let p: Profile = toml::from_str(&format!("{body}\nnet.engine = 'mark'")).unwrap();
@@ -973,15 +956,13 @@ agent.command = "claude"
     }
 
     #[test]
-    fn mcp_fallback_defaults_on_and_parses() {
-        // 票 20：默认开启（未声明 = true）；显式 true/false 均可解析。
-        let p: Profile = toml::from_str("egress = 'if:wg0'").unwrap();
-        assert!(p.mcp_fallback(), "未声明 = 默认开启（票 20）");
-        let off: Profile =
-            toml::from_str("egress = 'if:wg0'\nnet.mcp_fallback = false").unwrap();
-        assert!(!off.mcp_fallback());
-        let on: Profile = toml::from_str("egress = 'if:wg0'\nnet.mcp_fallback = true").unwrap();
-        assert!(on.mcp_fallback());
+    fn legacy_mcp_fallback_key_rejected_fail_loud() {
+        // 票 22：兜底轴删除（契约 = MCP server 先起，否则重启 cc）。旧配置含
+        // net.mcp_fallback 键 = 未知键 → deny_unknown_fields 明确报错
+        // （破坏性配置变更，fail-loud 语义）。
+        let err = toml::from_str::<Profile>("egress = 'if:wg0'\nnet.mcp_fallback = false");
+        let msg = format!("{}", err.expect_err("旧 net.mcp_fallback 键必须被拒绝"));
+        assert!(msg.contains("mcp_fallback"), "报错须点名未知键：{msg}");
     }
 
     #[test]

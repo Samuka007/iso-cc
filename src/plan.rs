@@ -185,13 +185,6 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
                 "8. relay 127.0.0.1:{port} -> gateway -> host loopback"
             ));
         }
-        // 票 20：MCP loopback 声明端口探活 + 快照缺口兜底轴。声明端口清单与探活
-        // 都在会话内视线（bootstrap/P-MCP 探针），plan 只展示声明轴——端口汇总归
-        // doctor（宿主视线）。
-        v.push(format!(
-            "8b. mcp-loopback (票 20): P-MCP probe + snapshot-gap socat fallback = {}（bootstrap 期探活声明端口；缺口起 marked socat，PDEATHSIG->cc，teardown 先于 pasta）",
-            if p.mcp_fallback() { "on" } else { "off" }
-        ));
     }
     for (k, val) in &p.env {
         v.push(format!("9. env {k}={val:?}"));
@@ -477,19 +470,10 @@ mod tests {
     }
 
     #[test]
-    fn mcp_fallback_plan_line_reflects_axis() {
-        // 票 20：netns 引擎展示 8b 轴行；默认 on，显式 off 可见
+    fn mcp_fallback_axis_absent_from_plan() {
+        // 票 22：兜底轴删除——任何引擎的 plan 都不再出现 mcp-loopback 行
         let p = prof("egress = 'if:wg0'");
         let joined = plan_lines("x", &p, None).join("\n");
-        assert!(joined.contains("fallback = on"), "{joined}");
-
-        let off = prof("egress = 'if:wg0'\nnet.mcp_fallback = false");
-        let joined = plan_lines("x", &off, None).join("\n");
-        assert!(joined.contains("fallback = off"), "{joined}");
-
-        // mark 引擎零 netns：机制轴整体不出现（结构性不适用，票 19 §6）
-        let mark = prof("egress = 'if:wg0'\nnet.engine = 'mark'");
-        let joined = plan_lines("x", &mark, None).join("\n");
         assert!(!joined.contains("mcp-loopback"), "{joined}");
     }
 }

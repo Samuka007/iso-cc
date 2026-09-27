@@ -1097,8 +1097,8 @@ pub fn run(
 /// MCP loopback 声明端口汇总（票 20）。声明源 = doctor 宿主视线下的 cc claude.json
 /// （cc_isolation=true → profile backing，与会话内 rw bind view 同源；false → 宿主
 /// `$HOME/.claude.json`，声明共享）+ 项目 `.mcp.json`；探活 = 宿主 127.0.0.1 connect。
-/// 全部可达 → Ok（attach 后原生镜像透明覆盖，零 socat）；缺口 → Warn（attach 后才
-/// 启动的宿主服务 = 快照缺口：fallback on 时兜底将补，off 时会话内 P-MCP 探针将红）。
+/// 全部可达 → Ok（attach 后原生镜像透明覆盖）；缺口 → Warn（attach 后才启动的
+/// 宿主服务 = 快照缺口——重启 cc 或先起服务，会话内 P-MCP 探针红显）。
 /// advisory 不 Fail——宿主服务晚启动是合法时序，红绿判归会话内探针。
 fn mcp_loopback_check(profile_name: &str, profile: &Profile, sys: &dyn SysInspect) -> Check {
     if profile.engine() == crate::config::Engine::Mark {
@@ -1131,7 +1131,7 @@ fn mcp_loopback_check(profile_name: &str, profile: &Profile, sys: &dyn SysInspec
         .copied()
         .filter(|p| sys.resolve_connect("127.0.0.1", *p).is_err())
         .collect();
-    mcp_check_assemble(&ports, &dead, profile.mcp_fallback())
+    mcp_check_assemble(&ports, &dead)
 }
 
 fn host_claude_json() -> PathBuf {
@@ -1140,13 +1140,13 @@ fn host_claude_json() -> PathBuf {
 }
 
 /// 汇总判定核（纯函数，票 20 单测锚）。
-fn mcp_check_assemble(ports: &[u16], dead: &[u16], fallback: bool) -> Check {
+fn mcp_check_assemble(ports: &[u16], dead: &[u16]) -> Check {
     if dead.is_empty() {
         Check::new(
             "mcp/loopback-ports",
             Status::Ok,
             format!(
-                "声明端口 {} 条全部宿主可达（attach 后原生镜像透明覆盖，零 socat）",
+                "声明端口 {} 条全部宿主可达（attach 后原生镜像透明覆盖）",
                 ports.len()
             ),
         )
@@ -1155,18 +1155,13 @@ fn mcp_check_assemble(ports: &[u16], dead: &[u16], fallback: bool) -> Check {
             "mcp/loopback-ports",
             Status::Warn,
             format!(
-                "声明 {} 条中 {} 条宿主未监听（{}）：attach 时刻快照缺口——{}",
+                "声明 {} 条中 {} 条宿主未监听（{}）：声明端口不可达（快照边界）——重启 cc 或先起服务；会话内 P-MCP 探针将红（快照边界见票 19 §3.2）",
                 ports.len(),
                 dead.len(),
                 dead.iter()
                     .map(std::string::ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", "),
-                if fallback {
-                    "bootstrap 兜底 socat 将补齐（票 20）"
-                } else {
-                    "net.mcp_fallback=false：无兜底，会话内 P-MCP 探针将红"
-                }
             ),
         )
     }
@@ -2263,24 +2258,19 @@ mod tests {
 
     #[test]
     fn mcp_check_all_reachable_is_ok() {
-        let c = mcp_check_assemble(&[8907, 8908], &[], true);
+        let c = mcp_check_assemble(&[8907, 8908], &[]);
         assert_eq!(c.status, Status::Ok, "{}", c.detail);
         assert!(c.detail.contains("2 条全部宿主可达"), "{}", c.detail);
     }
 
     #[test]
-    fn mcp_check_gap_with_fallback_warns_socat_fill() {
-        let c = mcp_check_assemble(&[8907, 8908], &[8908], true);
+    fn mcp_check_gap_warns_restart_or_start_server() {
+        // 票 22：兜底分支删除——缺口统一 Warn + 修复指引（重启 cc 或先起服务）
+        let c = mcp_check_assemble(&[8907, 8908], &[8908]);
         assert_eq!(c.status, Status::Warn, "{}", c.detail);
         assert!(c.detail.contains("8908"), "{}", c.detail);
-        assert!(c.detail.contains("兜底 socat 将补齐"), "{}", c.detail);
-    }
-
-    #[test]
-    fn mcp_check_gap_without_fallback_warns_probe_red() {
-        let c = mcp_check_assemble(&[8907], &[8907], false);
-        assert_eq!(c.status, Status::Warn, "{}", c.detail);
-        assert!(c.detail.contains("P-MCP 探针将红"), "{}", c.detail);
+        assert!(c.detail.contains("重启 cc 或先起服务"), "{}", c.detail);
+        assert!(!c.detail.contains("socat"), "兜底文案必须消失：{}", c.detail);
     }
 
     #[test]
