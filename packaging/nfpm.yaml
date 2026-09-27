@@ -9,6 +9,9 @@
 #     -c 为 0.x 期特性；下限 1.2.0（2022-09，bookworm/trixie/fedora/alpine 均满足）。
 #   - tun2proxy：socks 形态增强件 → Recommends（deb/rpm 弱依赖）；apk 无 recommends
 #     语义，由说明文档承担。
+#   - slirp4netns：2026-09-27 降级 Depends → Suggests（用户裁决）：仅为
+#     net.gateway="slirp4netns" 显式回退件；pasta 有上游静态单文件（bundle 模式
+#     libexec/ 已证），jammy 无 passt 包场景由 bundle 覆盖，非 slirp。
 #
 # 变量（nfpm os.ExpandEnv，无 :- 默认值语法，调用方必须显式导出）：
 #   ISO_CC_NFPM_VERSION — 纯 semver（tag 去 v 前缀）。
@@ -34,28 +37,32 @@ contents:
     dst: /usr/bin/iso-cc
 depends:
   - passt (>= 0.0~git20240220.1e6f92b)
-  - slirp4netns (>= 1.2.0)
 recommends:
   - tun2proxy
+suggests:
+  - slirp4netns (>= 1.2.0)
 overrides:
   deb:
     # dpkg 版本串；顶层 depends 即 deb 语法，此处仅显式化存档。
     depends:
       - passt (>= 0.0~git20240220.1e6f92b)
-      - slirp4netns (>= 1.2.0)
     recommends:
       - tun2proxy
+    suggests:
+      - slirp4netns (>= 1.2.0)
   rpm:
     # rpm 语义：passt 各发行版 EVR 方案不一（fedora 与 eln/centos stream 不同代），
     # 钉下限反而制造假冲突 → passt 不钉版本；slirp4netns 用 rpm 关系语法。
     depends:
       - passt
-      - slirp4netns >= 1.2.0
     recommends:
       - tun2proxy
+    suggests:
+      - slirp4netns >= 1.2.0
   apk:
     # apk 无弱依赖语义；alpine passt 版本方案（_git 后缀）无跨源可比基线，
     # edge/3.20+ community 的 pasta 均含全部所需 flag → 不钉版本。
     depends:
       - passt
-      - slirp4netns>=1.2.0
+    # slirp4netns：apk 无弱依赖语义且非默认路径（net.gateway 显式回退件）→ 不声明，
+    # 由说明文档承担（与 tun2proxy 同法）。
