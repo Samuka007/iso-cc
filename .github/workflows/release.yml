@@ -6,6 +6,8 @@
 #   bundle        packaging/bundle.sh（helper sha256 钉定校验）出 tar.gz
 #   pkgbuild-lint namcap 静态检查 PKGBUILD
 #   release       汇聚产物 + sha256sums.txt → GitHub Release
+#   publish       工单 21：deb → APT registry（aptline composite action，R2 后端；
+#                 APTLINE_* secrets 缺失时 skip + ::warning::，job 仍绿）
 #
 # 版本一致性由 build.rs fail-loud 守卫：tag 基线 != Cargo.toml version 时任何
 # cargo 构建即败（checks/packages/bundle 三路都过不了，无需重复脚本）。
@@ -128,3 +130,46 @@ jobs:
             --title "iso-cc $GITHUB_REF_NAME" \
             --notes-file release-notes.md \
             dist/iso-cc-* dist/sha256sums.txt
+
+  publish:
+    # 工单 21：deb → APT registry（aptline，R2 后端；本票交付形态 = dry-run，
+    # 全链已在 aptline 仓本地验收）。双重门：
+    # - job 级 gate：secrets 未配置 → skip + ::warning::，job 绿。这同时覆盖
+    #   aptline 仓尚未推送 GitHub 的窗口期（step 级 if 为 false 时 runner 不
+    #   解析 uses，占位 slug 不会弄挂 release 流水线）；凭据到位即激活，
+    #   零改码（仅需把 APTLINE_OWNER 换成 aptline 实际 slug，唯一待替换点）。
+    # - action 内 ci-gate：通用消费者契约（见 aptline/action/action.yml）。
+    # R2 三元组经 rclone env 注入（profile 名 r2，对应 --r2 r2:<bucket>）。
+    runs-on: ubuntu-latest
+    needs: packages
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: iso-cc-deb
+          path: dist
+      - id: gate
+        env:
+          APTLINE_R2_TARGET: ${{ secrets.APTLINE_R2_TARGET }}
+          APTLINE_GPG_PRIVATE_KEY: ${{ secrets.APTLINE_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$APTLINE_R2_TARGET" ] || [ -z "$APTLINE_GPG_PRIVATE_KEY" ]; then
+            echo "decision=skip" >> "$GITHUB_OUTPUT"
+            echo "::warning::aptline: secrets APTLINE_R2_TARGET / APTLINE_GPG_PRIVATE_KEY 未配置 — APT registry 发布跳过（配置即激活，零改码）"
+          else
+            echo "decision=publish" >> "$GITHUB_OUTPUT"
+          fi
+      - name: publish deb → APT registry (aptline)
+        if: steps.gate.outputs.decision == 'publish'
+        uses: APTLINE_OWNER/aptline/action@v0
+        with:
+          component: iso-cc
+          debs-glob: dist/iso-cc-*.deb
+          suite: stable
+          r2-target: ${{ secrets.APTLINE_R2_TARGET }}
+          gpg-private-key: ${{ secrets.APTLINE_GPG_PRIVATE_KEY }}
+          gpg-passphrase: ${{ secrets.APTLINE_GPG_PASSPHRASE }}
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.APTLINE_R2_ENDPOINT }}
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.APTLINE_R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.APTLINE_R2_SECRET_ACCESS_KEY }}
