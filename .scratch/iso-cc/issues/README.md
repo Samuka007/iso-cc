@@ -19,7 +19,8 @@
 | 19 mcp-transparent-loopback | 探究 done（2026-09-27：pasta 原生镜像 = 零组件透明；择型 c≫a>b；快照边界入档） | — |
 | 20 mcp-loopback-landing | ready（薄落地：P-MCP 探针 + 快照缺口 socat 兜底 + 冲突 Warn；估 2 人日内） | — |
 | 18B mark-engine-impl | done（2026-09-27，parent 亲验：mark 全链 + 集成 bug 修复 + 128 测试） | — |
-| 20 mcp-loopback-landing | done（2026-09-27，parent 亲验：原生镜像零组件穿透 200 实测 + 缺口 socat 兜底 + mark SKIP） | — |
+| 20 mcp-loopback-landing | done（2026-09-27 亲验）→ **兜底部分由 22 删除**（用户裁决：时序错位用重启解决，不打补丁） | — |
+| 22 remove-mcp-fallback | ready（删 net.mcp_fallback socat 兜底；P-MCP 探针保留改两态） | 21 |
 
 > **egress 目标形态（2026-09-27 用户裁决）**：4090 wg0 假设作废。出口 = 用户提供的真实隧道接口 或 D4 SOCKS 择型；地理身份探针（P13）在无隧道机器上恒按实红，不阻塞任何票。
 
