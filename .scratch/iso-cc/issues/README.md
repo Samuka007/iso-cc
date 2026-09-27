@@ -41,6 +41,17 @@
 
 | 21 ppa-publishing | in-flight（binary-repack 源码包路线：deb 树+组装脚本+lintian 阶梯；上传需用户 GPG/Launchpad 凭据） | — |
 
+| 21 execrpc-nix-sandbox-test | done（2026-09-27：host_shell 解析器 + 沙箱守卫，nix build 全绿亲验） | — |
+| 22 remove-mcp-fallback | ready（21 完成后可开工） | 21✅ |
+| 23 playwright-driver-exploration | 探究待派（用户指认的典型用例：R12 浏览器驱动层，orca 之外的组合位） | — |
+
+## 邻位协作（herdr 双 agent，w12 workspace）
+
+- w12:p1 = 邻居 agent：打包/发行面（packaging/**、.github/**、PPA/debian 源码包，自称工单 21 撞号已要求改 P 前缀）；**要求其建 linked worktree（branch packaging/ppa）迁移其未提交改动后在该 worktree 工作**
+- w12:p2 = 本 agent：src/**、flake.nix、.scratch/**（主 tracker 01-23）；已提交独占集（flake .c 过滤 + execrpc 沙箱修复 + 正本）
+- nfpm.yaml 归邻居，但保留用户裁决的依赖降级（Depends 仅 passt；tun2proxy→Recommends；slirp4netns→Suggests）
+- 提案已投递待回执；回执后本表加邻位产出一行
+
 ## 收尾态（2026-09-27）
 
 Agent 侧可做工作已全部完成（01-05、08-20 done）。剩余需外部输入：
