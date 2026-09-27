@@ -2,7 +2,15 @@
 
 **What to build:** 票 23/15 的验证缺口：host 模式下"cc（netns）→ L1.5 prefix → shim → exec.sock RPC → 宿主侧 spawn stdio MCP server → cc 持续调用其工具"全链**从未用真 MCP server 实测过**。本票 = 该链的逐跳 grounding + 缺口修复。
 
-**Blocked by:** 无　**Owner:** 待派
+**Blocked by:** 无　**Owner:** lane-mcp-grounding（完成）
+**Status:** done（2026-09-27，报告 /tmp/iso-cc-exp24/REPORT.md；E1 真负载全绿 parent 抽验）
+
+## Answer（PM 落）
+
+- **机制证实（源码级，字节偏移）**：stdio MCP spawn 走 L1.5「直 exec」形态——cc 以 CLAUDE_CODE_SHELL_PREFIX 本身为可执行文件、原命令+args 经 POSIX 单引号拼成单载荷（argv=[prefix, 单载荷]，shell:false）；与 execstub L1.5 契约**精确吻合**（E1 live argv 逐字验证）。附3 声明升级为机制证实
+- **E1 全绿**：真 claude -p 在 netns 会话 + exec.bash=host，@playwright/mcp 常驻 stdio 四次工具调用（navigate/snapshot/screenshot/close）全成功；SCM_RIGHTS 跨 netns 直通 fd 级实证；E2 worker kill → 3s 透明 respawn；E3/E4 teardown/突死 ≤0.5s 零残留
+- **G1（阻断级新 bug，转票 25）**：exec.bash=host 下 Bash 工具面 126 不通——Bash 工具的 prefix 机制与 MCP spawn 不同（prefix 拼进 -c 载荷 `'<prefix>' '<script>'`），execstub 对 `-l` 形态拒收 + 二跳缺 ISO_CC_EXEC_SOCK。附3『L1.5 覆盖 Bash 工具』在当前 shim 契约下不成立
+- G2（pidns 行为定性，无需修）/ G3（reap 误记，并入 25 顺手修）/ G4（chromium WSL2 flags 脚注）
 
 ## 背景（诚实状态）
 
