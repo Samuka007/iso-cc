@@ -50,6 +50,7 @@
 - 邻居已完成：PpaPublish 死 lane kill + 死件归档（/tmp/ppa-archived/）+ 主 checkout 清空；worktree /home/nixos/workspace/iso-cc-packaging（分支 packaging/ppa，基于我方 HEAD）建立；nfpm 降级已随迁（ef07e97）；AptlinePub 已通知迁址；aptline 独立仓库 /home/nixos/workspace/aptline 不受影响
 - 我方处置：其遗留撞号工单 21-ppa-publishing.md → 归档 issues-ppa/P1-ppa-publishing.md（P 命名空间）
 - 状态：邻居继续在 worktree 做 R2 APT registry + PPA（等待操作者凭据四件套：R2 token/GPG/域名/secrets——wizard 项）
+- 双向回执闭环（2026-09-27）：协议双方确认，零异议。nfpm 两版冲突裁决 = 降级系 PM 于 08 验证后执行（票 08 已加后记澄清时序），操作者可否决回滚 ef07e97
 
 - w12:p1 = 邻居 agent：打包/发行面（packaging/**、.github/**、PPA/debian 源码包，自称工单 21 撞号已要求改 P 前缀）；**要求其建 linked worktree（branch packaging/ppa）迁移其未提交改动后在该 worktree 工作**
 - w12:p2 = 本 agent：src/**、flake.nix、.scratch/**（主 tracker 01-23）；已提交独占集（flake .c 过滤 + execrpc 沙箱修复 + 正本）
