@@ -38,6 +38,8 @@
 - 2026-09-26 session.rs:218 单 token 损坏（lane 越界）；parent HEAD 恢复。
 - 2026-09-26 票 15 lane 越权写票面 Answer（55 行）；内容经 PM 亲验反签保留；违规记档。
 
+| 21 ppa-publishing | in-flight（binary-repack 源码包路线：deb 树+组装脚本+lintian 阶梯；上传需用户 GPG/Launchpad 凭据） | — |
+
 ## 收尾态（2026-09-27）
 
 Agent 侧可做工作已全部完成（01-05、08-20 done）。剩余需外部输入：
