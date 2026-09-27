@@ -308,6 +308,51 @@ pub fn run(declared_tz: &str, allow_under: &[PathBuf]) -> Vec<Probe> {
         )),
     }
 
+    // P-MCP（票 20）：声明 MCP loopback 端口探活（connect 成功即绿，不解析协议）。
+    // 扫描源 = cc 视线：$HOME/.claude.json（ADR 0006 重定向后路径——verify 会话已
+    // 进 mountns）+ 项目 .mcp.json。mark 引擎（uid 4210 编译期钉定树）零 netns，
+    // 127.0.0.1 天然直达宿主 → 机制 SKIP（票 19 §6）——SKIP 取证 = 票 20 验收锚。
+    if real_uid_is_mark() {
+        out.push(Probe::new(
+            "P-MCP/loopback",
+            Verdict::Skip,
+            "engine=mark（uid 4210 树，零 netns）：127.0.0.1 天然直达宿主——机制 SKIP（票 19 §6）",
+        ));
+    } else {
+        let claude_json = home.join(".claude.json");
+        let project_mcp = std::env::current_dir().ok().map(|d| d.join(".mcp.json"));
+        let ports = crate::config::mcp_loopback_ports(&claude_json, project_mcp.as_deref());
+        if ports.is_empty() {
+            out.push(Probe::new(
+                "P-MCP/loopback",
+                Verdict::Skip,
+                "无声明条目（claude.json/.mcp.json 无 http/https/sse loopback MCP）",
+            ));
+        } else {
+            for port in ports {
+                let reachable =
+                    std::net::TcpStream::connect_timeout(
+                        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                        std::time::Duration::from_secs(1),
+                    )
+                    .is_ok();
+                let (verdict, detail) = if reachable {
+                    mcp_classify(true, None)
+                } else {
+                    // connect 失败 → bind 探测二分缺口语义（真缺口 vs 会话内占用）
+                    let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+                        .is_err();
+                    mcp_classify(false, Some(held))
+                };
+                out.push(Probe::new(
+                    &format!("P-MCP/loopback:{port}"),
+                    verdict,
+                    detail,
+                ));
+            }
+        }
+    }
+
     // P8 写集探针判定（套件收尾执行 find）：实测写集 ⊆ 声明重定向集 ∪ 白名单
     // （允许根由 spawn 侧按声明推导注入）。白名单外出现即 Fail（R4 核心不变式）。
     match (marker_ok, p8_write_set(&home, &marker)) {
@@ -354,8 +399,51 @@ pub fn run(declared_tz: &str, allow_under: &[PathBuf]) -> Vec<Probe> {
     out
 }
 
+/// mark 引擎判据（票 20）：会话树 real uid == MARK_UID（票 18 编译期钉定的 file-cap
+/// 助手降权面）。/proc/self/status 纯读（crate 纪律：unsafe 只在 ns.rs，probe 词法
+/// 无 libc 调用）；读取失败 = 非 mark（netns 探针路径照常）。
+fn real_uid_is_mark() -> bool {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    status
+        .lines()
+        .find(|l| l.starts_with("Uid:"))
+        .and_then(|l| l["Uid:".len()..].split_whitespace().next())
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|uid| uid == crate::config::MARK_UID)
+        .unwrap_or(false)
+}
+
 pub fn any_fail(probes: &[Probe]) -> bool {
     probes.iter().any(|p| p.verdict == Verdict::Fail)
+}
+
+/// P-MCP 判定核（纯函数，票 20 单测锚）：connect 成功 = 绿（pasta 原生镜像或兜底
+/// 转发器任一承载，探活语义只看 connect）；connect 失败时以 bind 探测二分缺口语义
+/// ——端口空闲 = 真缺口（Fail：无镜像无兜底，票 20 fallback=false 红锚）；端口被
+/// 持有 = 会话内占用（Warn：本地服务优先，跳过红判——票 20 冲突语义 / exp19 §4
+/// EADDRINUSE）。
+fn mcp_classify(reachable: bool, held: Option<bool>) -> (Verdict, String) {
+    if reachable {
+        return (
+            Verdict::Pass,
+            "connect 127.0.0.1 OK（原生镜像/兜底转发器任一承载；探活 = connect 成功）".into(),
+        );
+    }
+    match held {
+        Some(true) => (
+            Verdict::Warn,
+            "connect 失败但端口被持有（EADDRINUSE）：会话内服务/兜底转发器占用——本地服务优先，跳过红判（票 20 冲突语义）"
+                .into(),
+        ),
+        Some(false) => (
+            Verdict::Fail,
+            "connect 失败且端口空闲：宿主未监听且无兜底（快照缺口未补——net.mcp_fallback=false 或兜底失效）"
+                .into(),
+        ),
+        None => unreachable!("connect 失败必有 bind 探测结果"),
+    }
 }
 
 pub fn render_human(probes: &[Probe]) -> String {
@@ -438,5 +526,28 @@ mod tests {
     fn p8_empty_write_set_passes() {
         let home = PathBuf::from("/home/u");
         assert!(p8_violations(&[], &roots(&home)).is_empty());
+    }
+
+    #[test]
+    fn p_mcp_classify_reachable_is_pass() {
+        let (v, d) = mcp_classify(true, None);
+        assert_eq!(v, Verdict::Pass);
+        assert!(d.contains("connect 127.0.0.1 OK"), "{d}");
+    }
+
+    #[test]
+    fn p_mcp_classify_free_dead_port_is_fail() {
+        // 真缺口（端口空闲）：fallback=false 红锚（票 20 验收 2）
+        let (v, d) = mcp_classify(false, Some(false));
+        assert_eq!(v, Verdict::Fail);
+        assert!(d.contains("快照缺口未补"), "{d}");
+    }
+
+    #[test]
+    fn p_mcp_classify_held_port_is_warn_session_conflict() {
+        // 会话自占端口（EADDRINUSE）：本地服务优先，跳过红判（票 20 验收 3）
+        let (v, d) = mcp_classify(false, Some(true));
+        assert_eq!(v, Verdict::Warn);
+        assert!(d.contains("本地服务优先"), "{d}");
     }
 }

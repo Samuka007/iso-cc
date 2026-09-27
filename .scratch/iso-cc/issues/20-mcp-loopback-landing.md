@@ -2,7 +2,14 @@
 
 **What to build:** 票 19 探究结论的产品化（薄）：pasta 原生镜像已是默认行为（零组件），落地 = 探针 + 缺口兜底 + 配置感知告警。
 
-**Blocked by:** 无（05/09 已合入）　**Owner:** 待派
+**Blocked by:** 无（05/09 已合入）　**Owner:** lane-mcp-loop-land（完成）
+**Status:** done（2026-09-27，parent 亲验通过）
+
+## Answer（PM 落）
+
+- 五锚全绿 + parent 复跑：nextest 141/141；自制场景亲验——宿主 python http.server :18755，netns 会话内 `curl 127.0.0.1:18755` → **200**（原生镜像零组件穿透，产品路径）
+- 实现面：net.mcp_fallback 轴（默认 true；mark 声明性拒绝）；扫描器（claude.json root+projects + .mcp.json，只取 scheme/host/port，脱敏天然成立）；缺口 socat marked 子进程 + PDEATHSIG→cc（teardown 顺序结构性成立，零残留实测）；P-MCP 三态判定核（绿/红/EADDRINUSE-Warn）；mark 引擎 SKIP（uid 判据纯读 /proc/self/status，unsafe 零新增）
+- 诚实边界：socat 走 PATH 解析（best-effort，manifest 契约未触碰，缺失=Warn 继续）；会话遗留 5 个合成 profile setup 态（gc --profile 可回收）
 
 ## Specification（依据 19 REPORT §8 票草 + PM 收窄）
 

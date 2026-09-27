@@ -1087,7 +1087,89 @@ pub fn run(
         ));
     }
 
+    // 9. MCP loopback 声明端口 vs 宿主现实汇总（票 20 spec#4）：engine=netns 限定；
+    //    mark 引擎 SKIP（零 netns，127.0.0.1 天然直达宿主——票 19 §6）。
+    out.push(mcp_loopback_check(profile_name, profile, sys));
+
     out
+}
+
+/// MCP loopback 声明端口汇总（票 20）。声明源 = doctor 宿主视线下的 cc claude.json
+/// （cc_isolation=true → profile backing，与会话内 rw bind view 同源；false → 宿主
+/// `$HOME/.claude.json`，声明共享）+ 项目 `.mcp.json`；探活 = 宿主 127.0.0.1 connect。
+/// 全部可达 → Ok（attach 后原生镜像透明覆盖，零 socat）；缺口 → Warn（attach 后才
+/// 启动的宿主服务 = 快照缺口：fallback on 时兜底将补，off 时会话内 P-MCP 探针将红）。
+/// advisory 不 Fail——宿主服务晚启动是合法时序，红绿判归会话内探针。
+fn mcp_loopback_check(profile_name: &str, profile: &Profile, sys: &dyn SysInspect) -> Check {
+    if profile.engine() == crate::config::Engine::Mark {
+        return Check::new(
+            "mcp/loopback-ports",
+            Status::Ok,
+            "mark 引擎 SKIP（零 netns：127.0.0.1 天然直达宿主，机制不适用——票 19 §6）",
+        );
+    }
+    let claude_json = if profile.cc_isolation() {
+        crate::config::cc_builtin_pairs(profile_name)
+            .into_iter()
+            .find(|p| p.key == "claude.json")
+            .map(|p| p.backing)
+            .unwrap_or_else(host_claude_json)
+    } else {
+        host_claude_json()
+    };
+    let project_mcp = std::env::current_dir().ok().map(|d| d.join(".mcp.json"));
+    let ports = crate::config::mcp_loopback_ports(&claude_json, project_mcp.as_deref());
+    if ports.is_empty() {
+        return Check::new(
+            "mcp/loopback-ports",
+            Status::Ok,
+            "无声明条目（claude.json/.mcp.json 无 http/https/sse loopback MCP；会话内 P-MCP 探针 SKIP）",
+        );
+    }
+    let dead: Vec<u16> = ports
+        .iter()
+        .copied()
+        .filter(|p| sys.resolve_connect("127.0.0.1", *p).is_err())
+        .collect();
+    mcp_check_assemble(&ports, &dead, profile.mcp_fallback())
+}
+
+fn host_claude_json() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    Path::new(&home).join(".claude.json")
+}
+
+/// 汇总判定核（纯函数，票 20 单测锚）。
+fn mcp_check_assemble(ports: &[u16], dead: &[u16], fallback: bool) -> Check {
+    if dead.is_empty() {
+        Check::new(
+            "mcp/loopback-ports",
+            Status::Ok,
+            format!(
+                "声明端口 {} 条全部宿主可达（attach 后原生镜像透明覆盖，零 socat）",
+                ports.len()
+            ),
+        )
+    } else {
+        Check::new(
+            "mcp/loopback-ports",
+            Status::Warn,
+            format!(
+                "声明 {} 条中 {} 条宿主未监听（{}）：attach 时刻快照缺口——{}",
+                ports.len(),
+                dead.len(),
+                dead.iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if fallback {
+                    "bootstrap 兜底 socat 将补齐（票 20）"
+                } else {
+                    "net.mcp_fallback=false：无兜底，会话内 P-MCP 探针将红"
+                }
+            ),
+        )
+    }
 }
 
 pub fn any_fail(checks: &[Check]) -> bool {
@@ -2177,5 +2259,37 @@ mod tests {
         let checks = mark_checks(&sys, "");
         assert_eq!(check(&checks, "mark/rule").status, Status::Fail);
         assert_eq!(check(&checks, "mark/table").status, Status::Fail);
+    }
+
+    #[test]
+    fn mcp_check_all_reachable_is_ok() {
+        let c = mcp_check_assemble(&[8907, 8908], &[], true);
+        assert_eq!(c.status, Status::Ok, "{}", c.detail);
+        assert!(c.detail.contains("2 条全部宿主可达"), "{}", c.detail);
+    }
+
+    #[test]
+    fn mcp_check_gap_with_fallback_warns_socat_fill() {
+        let c = mcp_check_assemble(&[8907, 8908], &[8908], true);
+        assert_eq!(c.status, Status::Warn, "{}", c.detail);
+        assert!(c.detail.contains("8908"), "{}", c.detail);
+        assert!(c.detail.contains("兜底 socat 将补齐"), "{}", c.detail);
+    }
+
+    #[test]
+    fn mcp_check_gap_without_fallback_warns_probe_red() {
+        let c = mcp_check_assemble(&[8907], &[8907], false);
+        assert_eq!(c.status, Status::Warn, "{}", c.detail);
+        assert!(c.detail.contains("P-MCP 探针将红"), "{}", c.detail);
+    }
+
+    #[test]
+    fn mcp_check_mark_engine_skips() {
+        // mark 引擎 SKIP 取证（票 20 spec#4）
+        let p: Profile =
+            toml::from_str("egress = 'if:wg0'\nnet.engine = 'mark'").unwrap();
+        let c = mcp_loopback_check("x", &p, &RealSys);
+        assert_eq!(c.status, Status::Ok);
+        assert!(c.detail.contains("mark 引擎 SKIP"), "{}", c.detail);
     }
 }

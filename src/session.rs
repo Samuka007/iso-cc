@@ -33,6 +33,11 @@ pub struct BootstrapPlan {
     /// 旧 JSON 兼容（deny_unknown_fields 只拒未知键，不要求新键存在）。
     #[serde(default)]
     pub socks: Option<SocksPlan>,
+    /// MCP loopback 快照缺口兜底（票 20）：true = bootstrap 在 wait_ready 后、
+    /// exec 前对声明端口探活并对缺口起 marked socat。`#[serde(default)]` 保持
+    /// 旧 JSON 兼容（socks 键先例）；mark 引擎路径恒 false（机制不适用）。
+    #[serde(default)]
+    pub mcp_fallback: bool,
 }
 
 /// socks worker 计划：proxy host 运行时在 ns 内经 netlink 发现（tap0 默认路由网关
@@ -240,6 +245,8 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
                 iface: String::new(),
                 timeout_ms: 0,
                 socks: None,
+                // mark 零 netns：127.0.0.1 天然直达宿主，缺口兜底机制不适用（票 19 §6）
+                mcp_fallback: false,
             },
             gateway_bin: PathBuf::new(),
             exec: exec_channel,
@@ -343,6 +350,7 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
         iface: provider::NS_IFNAME.to_string(),
         timeout_ms: 15_000,
         socks: socks_plan,
+        mcp_fallback: profile.mcp_fallback(),
     };
 
     let inner = build_inner(&mode, profile_name, profile);
@@ -763,12 +771,157 @@ fn bootstrap_exec(
     if let Some(socks) = &plan.socks {
         spawn_socks_worker_and_wait(plan, socks, session_id)?;
     }
+    // 票 20：MCP loopback 声明端口探活 + 快照缺口 socat 兜底（wait_ready 后、exec
+    // 前；best-effort，任何失败 Warn 继续，绝不阻断 exec）。
+    mcp_gap_fallback(plan, session_id);
     let mut c = Command::new(prog);
     for a in &command[1..] {
         c.arg(a);
     }
     let err = c.exec();
     Err(anyhow!("exec 失败: {err}"))
+}
+
+/// 声明端口探活（票 20 spec#1 语义）：connect 成功即可，不解析协议；1s 超时。
+fn loopback_tcp_reachable(port: u16, timeout: Duration) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        timeout,
+    )
+    .is_ok()
+}
+
+/// MCP loopback 快照缺口兜底（票 20 spec#2/3）：对 cc 视线的 claude.json（ADR 0006
+/// 重定向后路径——bootstrap 已进 mountns，`$HOME/.claude.json` 即 profile backing
+/// 的 rw bind view）+ 项目 `.mcp.json` 扫描出的 http/sse loopback 声明端口逐个探活。
+/// pasta 镜像集 = attach 时刻快照（exp19 §3.0），探活失败 = 快照缺口 → bind 探测后
+/// 起 socat `TCP-LISTEN:<p>,bind=127.0.0.1,fork,reuseaddr TCP:<gw>:<p>` 补齐。
+///
+/// 冲突语义（spec#3，exp19 §4）：bind 探测 EADDRINUSE = 端口已被持有（会话内服务/
+/// 兜底转发器）→ 本地服务优先，跳过 + Warn，绝不起转发器。
+///
+/// 生命周期（exp19 §5）：socat = marked 子进程（ISO_CC_SESSION）+ PDEATHSIG→bootstrap
+/// （exec cc 后父 pid 不变 = PDEATHSIG→cc）——cc 退出即被内核击杀，先于 pasta
+/// （pidns init）退出与 netns 销毁，「先转发进程 → 后 pasta」结构性成立（孤儿 socat
+/// 会拽住 netns，exp19 实测）。日志落会话资产 mcp-fallback.log（13 sweep 回收）。
+fn mcp_gap_fallback(plan: &BootstrapPlan, session_id: &str) {
+    if !plan.mcp_fallback {
+        return;
+    }
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()));
+    let project_mcp = std::env::current_dir().ok().map(|d| d.join(".mcp.json"));
+    let ports =
+        crate::config::mcp_loopback_ports(&home.join(".claude.json"), project_mcp.as_deref());
+    if ports.is_empty() {
+        return;
+    }
+    let gw = match netcfg::default_gateway(&plan.iface) {
+        Ok(gw) => gw,
+        Err(e) => {
+            eprintln!(
+                "[iso-cc] mcp-loopback: 网关地址发现失败（{e}）——缺口兜底跳过（缺口由会话内 P-MCP 探针红显）"
+            );
+            return;
+        }
+    };
+    let socat = match provider::which("socat") {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[iso-cc] mcp-loopback: socat 不在 PATH——缺口兜底不可用（缺口由会话内 P-MCP 探针红显）"
+            );
+            return;
+        }
+    };
+    let log_file = match session_dir(session_id) {
+        Ok(d) => d.join("mcp-fallback.log"),
+        Err(e) => {
+            eprintln!("[iso-cc] mcp-loopback: 会话资产目录不可用（{e}）——缺口兜底跳过");
+            return;
+        }
+    };
+    let log = match std::fs::File::create(&log_file) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "[iso-cc] mcp-loopback: 写 {} 失败（{e}）——缺口兜底跳过",
+                log_file.display()
+            );
+            return;
+        }
+    };
+    for port in ports {
+        if loopback_tcp_reachable(port, Duration::from_secs(1)) {
+            eprintln!("[iso-cc] mcp-loopback: port={port} reachable（pasta 原生镜像覆盖，零动作）");
+            continue;
+        }
+        match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                eprintln!(
+                    "iso-cc: mcp-loopback skip port={port} reason=session-conflict（本地服务优先，exp19 §4）"
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "iso-cc: mcp-loopback skip port={port} reason=bind-probe-failed（{e}）"
+                );
+            }
+            Ok(listener) => {
+                drop(listener);
+                match spawn_socat_forwarder(&socat, gw, port, session_id, &log, &log_file) {
+                    Ok(pid) => eprintln!(
+                        "[iso-cc] mcp-loopback: socat port={port} -> {gw}:{port}（快照缺口兜底，marked pid={pid}）"
+                    ),
+                    Err(e) => eprintln!(
+                        "iso-cc: mcp-loopback skip port={port} reason=socat-failed（{e:#}）"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// 起单端口 socat 转发器（exp19 proto3 E 已证形态）。返回 pid；早期退出（bind 竞态
+/// 等）= Err，日志尾部随 Warn 上浮——缺口不静默。
+fn spawn_socat_forwarder(
+    socat: &Path,
+    gw: Ipv4Addr,
+    port: u16,
+    session_id: &str,
+    log: &std::fs::File,
+    log_file: &Path,
+) -> anyhow::Result<u32> {
+    let mut c = Command::new(socat);
+    c.arg(format!("TCP-LISTEN:{port},bind=127.0.0.1,fork,reuseaddr"))
+        .arg(format!("TCP:{gw}:{port}"));
+    // marked 子进程（票 13 语义）：list/sweep 识别键与 socks worker 同规
+    c.env("ISO_CC_SESSION", session_id);
+    c.stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone().context("mcp-fallback.log 复制句柄")?))
+        .stderr(Stdio::from(log.try_clone().context("mcp-fallback.log 复制句柄")?));
+    // PDEATHSIG→bootstrap：exec cc 不换 pid = PDEATHSIG→cc；cc 死亡即内核击杀转发器，
+    // 先于 pasta 收割 netns——teardown 顺序结构性保证，无显式收割表（exp19 §5）。
+    let expected_ppid = std::process::id();
+    ns::install_pre_exec(&mut c, move || {
+        ns::set_pdeathsig_verified(libc::SIGKILL, expected_ppid)
+    });
+    let mut child = c
+        .spawn()
+        .with_context(|| format!("spawn socat（{}）", socat.display()))?;
+    let pid = child.id();
+    // 早期退出检测（socks worker #B 同构，非致命）：150ms 内退出 = bind 失败类
+    std::thread::sleep(Duration::from_millis(150));
+    if let Some(status) = child.try_wait().context("try_wait socat 转发器")? {
+        let tail = tail_lines(log_file, 20);
+        bail!(
+            "socat 早期退出（status={status}）；{} 末尾：\n{tail}",
+            log_file.display()
+        );
+    }
+    // 句柄有意丢弃（Child drop 不杀进程）：生命周期由 PDEATHSIG→bootstrap(cc) 结构性
+    // 保证（socks worker 同规），Session/bootstrap 均不持有。
+    drop(child);
+    Ok(pid)
 }
 
 /// socks 分支（工单 16）：netns 内 spawn tun2proxy worker（标记 + PDEATHSIG→本进程）
@@ -990,6 +1143,7 @@ mod tests {
             iface: provider::NS_IFNAME.into(),
             timeout_ms: 15_000,
             socks: None,
+            mcp_fallback: true,
         };
         let json = serde_json::to_string(&plan).unwrap();
         let back: BootstrapPlan = serde_json::from_str(&json).unwrap();
@@ -1000,6 +1154,7 @@ mod tests {
             "{json}"
         );
         assert!(json.contains("[[\"/a\",\"/b\"]]"), "{json}");
+        assert!(json.contains("\"mcp_fallback\":true"), "{json}");
     }
 
     #[test]
@@ -1010,6 +1165,8 @@ mod tests {
         )
         .unwrap();
         assert!(old.rw_binds.is_empty());
+        // 票 20 新键同规：旧 plan JSON（无 mcp_fallback 键）仍可解析，缺省 false
+        assert!(!old.mcp_fallback);
     }
 
     #[test]
@@ -1038,6 +1195,7 @@ mod tests {
             iface: provider::NS_IFNAME.into(),
             timeout_ms: 15_000,
             socks: None,
+            mcp_fallback: false,
         };
         let json = serde_json::to_string(&plan).unwrap();
         assert!(json.contains("\"mode\":\"selfmap\""), "{json}");
@@ -1056,6 +1214,7 @@ mod tests {
                 port: 7891,
                 tun: provider::socks::TUN_IFNAME.into(),
             }),
+            mcp_fallback: false,
         };
         let json = serde_json::to_string(&plan).unwrap();
         assert!(

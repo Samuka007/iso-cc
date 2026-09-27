@@ -195,6 +195,11 @@ pub struct Net {
     /// 网关 DNS 转发地址（pasta `--dns-forward`；未声明 = 10.0.2.3）。
     #[serde(default)]
     pub dns: Option<Ipv4Addr>,
+    /// MCP loopback 快照缺口兜底轴（票 20）：true（默认）= bootstrap 期对声明
+    /// http/sse loopback MCP 端口探活，探活失败（pasta 镜像 = attach 时刻快照）
+    /// 起 socat 转发器补齐；false = 无兜底（缺口由 P-MCP 探针红显）。
+    #[serde(default)]
+    pub mcp_fallback: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -276,6 +281,92 @@ pub fn cc_builtin_pairs(profile_name: &str) -> Vec<CcBuiltinPair> {
     ]
 }
 
+// ===== MCP loopback 声明扫描（票 20）=====
+//
+// 扫描源 = cc 视线的 claude.json（netns 内即 ADR 0006 重定向后路径：
+// cc_isolation=true 时 `$HOME/.claude.json` 就是 profile backing 的 rw bind view）
+// + 项目 `.mcp.json`。解析只取 (scheme, host, port) 三元组（exp19 §1：token 常见
+// 于 path/query/header ⇒ 其余一律不解析不落盘）：scheme ∈ {http, https, sse} 且
+// host ∈ {127.0.0.1, localhost, ::1}；port 缺省按 scheme（http/sse=80、https=443）。
+// stdio/command 型条目无 url，天然不命中。文件缺失/不可读/JSON 畸形/条目畸形 =
+// 无声明（0 条），不报错——「声明缺席」与「声明损坏」同归无条目，探针层 SKIP。
+
+/// 声明端口全集（排序去重）。消费方：bootstrap 缺口兜底（session）、P-MCP 探针
+///（probe）、doctor 声明端口汇总。
+pub fn mcp_loopback_ports(claude_json: &Path, project_mcp_json: Option<&Path>) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for path in std::iter::once(claude_json).chain(project_mcp_json) {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        mcp_collect(&v, &mut ports);
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// 根对象收面：root `mcpServers` + `projects.<path>.mcpServers`（claude.json 两层
+/// 形态；`.mcp.json` 只有前者，同函数无害共用）。
+fn mcp_collect(root: &serde_json::Value, out: &mut Vec<u16>) {
+    if let Some(servers) = root["mcpServers"].as_object() {
+        for entry in servers.values() {
+            if let Some(port) = entry["url"].as_str().and_then(url_loopback_port) {
+                out.push(port);
+            }
+        }
+    }
+    if let Some(projects) = root["projects"].as_object() {
+        for proj in projects.values() {
+            if let Some(servers) = proj["mcpServers"].as_object() {
+                for entry in servers.values() {
+                    if let Some(port) = entry["url"].as_str().and_then(url_loopback_port) {
+                        out.push(port);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// URL → loopback 端口判定核（纯函数，票 20 单测锚）。None = 非本机制范围
+/// （非 http/https/sse、host 非 loopback、端口非法）。v6 仅认 `[::1]` 括号形态。
+pub(crate) fn url_loopback_port(url: &str) -> Option<u16> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https" | "sse") {
+        return None;
+    }
+    // authority = 首个 path/query/fragment 分隔符之前
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // 去 userinfo（host 面不含裸 '@'，取最后一个 '@' 之后）
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let default_port: u16 = if scheme == "https" { 443 } else { 80 };
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let (h, after) = v6.split_once(']')?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse::<u16>().ok()?,
+            None => default_port,
+        };
+        (h, port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse::<u16>().ok()?),
+            None => (authority, default_port),
+        }
+    };
+    if port == 0 {
+        return None;
+    }
+    matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1").then_some(port)
+}
+
 impl Profile {
     /// 解析 egress 引用（D4 修订：`if:<name>` | `socks5://<host>:<port>` 两形态）。
     pub fn egress(&self) -> Result<Egress, ConfigError> {
@@ -327,6 +418,11 @@ impl Profile {
     /// 生效 DNS 转发地址（未声明 = 10.0.2.3）。
     pub fn dns(&self) -> Ipv4Addr {
         self.net.dns.unwrap_or(DEFAULT_DNS)
+    }
+
+    /// 生效 MCP 快照缺口兜底（未声明 = true，票 20 默认开启）。
+    pub fn mcp_fallback(&self) -> bool {
+        self.net.mcp_fallback.unwrap_or(true)
     }
 
     /// 结构校验：返回错误清单（空 = 通过）。宿主事实检查归 doctor，不在这里。
@@ -391,6 +487,12 @@ impl Profile {
             if self.net.dns.is_some() {
                 errs.push(
                     "net.dns 是 netns DNS 转发地址；mark 引擎 DNS 元数据走宿主解析器（票 18 已登记例外，resolv bind 无 mountns 承载），轴不适用"
+                        .to_string(),
+                );
+            }
+            if self.net.mcp_fallback.is_some() {
+                errs.push(
+                    "net.mcp_fallback 是 netns 快照缺口兜底轴（票 20）；mark 引擎零 netns（127.0.0.1 天然直达宿主），机制不适用（票 19 §6）"
                         .to_string(),
                 );
             }
@@ -857,6 +959,7 @@ agent.command = "claude"
             "egress = 'if:w'\nnet.private = 'host'".to_string(),
             "egress = 'if:w'\nnet.gateway = 'pasta'".to_string(),
             "egress = 'if:w'\nnet.dns = '10.0.2.3'".to_string(),
+            "egress = 'if:w'\nnet.mcp_fallback = false".to_string(),
         ];
         for body in cases {
             let p: Profile = toml::from_str(&format!("{body}\nnet.engine = 'mark'")).unwrap();
@@ -867,5 +970,92 @@ agent.command = "claude"
                 "{body} 在 mark 下应被声明性拒绝：{errs:?}"
             );
         }
+    }
+
+    #[test]
+    fn mcp_fallback_defaults_on_and_parses() {
+        // 票 20：默认开启（未声明 = true）；显式 true/false 均可解析。
+        let p: Profile = toml::from_str("egress = 'if:wg0'").unwrap();
+        assert!(p.mcp_fallback(), "未声明 = 默认开启（票 20）");
+        let off: Profile =
+            toml::from_str("egress = 'if:wg0'\nnet.mcp_fallback = false").unwrap();
+        assert!(!off.mcp_fallback());
+        let on: Profile = toml::from_str("egress = 'if:wg0'\nnet.mcp_fallback = true").unwrap();
+        assert!(on.mcp_fallback());
+    }
+
+    #[test]
+    fn url_loopback_port_classifies() {
+        // 命中面：scheme ∈ {http, https, sse} × host ∈ {127.0.0.1, localhost, ::1}
+        let hit = [
+            ("http://127.0.0.1:8907/mcp", 8907),
+            ("http://localhost:8908/sse", 8908),
+            ("https://127.0.0.1:9443/mcp", 9443),
+            ("sse://[::1]:9907", 9907),
+            ("http://[::1]", 80),
+            ("https://localhost", 443),
+            ("HTTP://127.0.0.1:8909", 8909), // scheme 大小写不敏感
+            ("http://user:pw@127.0.0.1:8910/mcp?token=x", 8910), // userinfo/query 丢弃
+        ];
+        for (url, want) in hit {
+            assert_eq!(url_loopback_port(url), Some(want), "{url}");
+        }
+        // 拒绝面：非 loopback、非本机制 scheme、畸形、端口 0
+        let miss = [
+            "http://example.com:8907/mcp",
+            "http://10.0.0.5:8907",
+            "stdio://127.0.0.1:8907",
+            "ftp://127.0.0.1:21",
+            "127.0.0.1:8907",     // 无 scheme
+            "http://127.0.0.1:0", // 端口 0 无意义
+            "http://127.0.0.1:port",
+            "",
+        ];
+        for url in miss {
+            assert_eq!(url_loopback_port(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn mcp_loopback_ports_scans_claude_and_project_json() {
+        let dir = tempfile::tempdir().unwrap();
+        // claude.json：root + projects 两层形态；混入 stdio 条目（无 url，不命中）
+        let claude = dir.path().join("claude.json");
+        std::fs::write(
+            &claude,
+            r#"{
+                "mcpServers": {
+                    "local": {"type": "http", "url": "http://127.0.0.1:8907/mcp"},
+                    "tools": {"type": "stdio", "command": "mcp-server-tools"},
+                    "v6": {"url": "http://[::1]:8908"}
+                },
+                "projects": {
+                    "/home/u/proj": {"mcpServers": {
+                        "proj": {"type": "sse", "url": "http://localhost:8909/sse"}
+                    }},
+                    "/home/u/other": {"mcpServers": {}}
+                }
+            }"#,
+        )
+        .unwrap();
+        // 项目 .mcp.json：同端口去重 + 新端口
+        let mcp = dir.path().join(".mcp.json");
+        std::fs::write(
+            &mcp,
+            r#"{"mcpServers": {
+                "again": {"url": "http://127.0.0.1:8907/mcp"},
+                "extra": {"url": "https://127.0.0.1:9443"}
+            }}"#,
+        )
+        .unwrap();
+        let ports = mcp_loopback_ports(&claude, Some(&mcp));
+        assert_eq!(ports, vec![8907, 8908, 8909, 9443]);
+        // 只给 claude.json
+        assert_eq!(mcp_loopback_ports(&claude, None), vec![8907, 8908, 8909]);
+        // 缺失/畸形 = 0 条（不报错）
+        assert!(mcp_loopback_ports(&dir.path().join("nope.json"), None).is_empty());
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, "not json").unwrap();
+        assert!(mcp_loopback_ports(&bad, None).is_empty());
     }
 }
