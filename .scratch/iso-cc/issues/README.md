@@ -16,7 +16,9 @@
 
 ## 剩余工作
 
-| 19 mcp-transparent-loopback | 探究待派（用户提案：读 cc MCP 配置自动端口映射，netns 内 127.0.0.1 透明回环；隐私脱敏要求见票面） | — |
+| 19 mcp-transparent-loopback | 探究 done（2026-09-27：pasta 原生镜像 = 零组件透明；择型 c≫a>b；快照边界入档） | — |
+| 20 mcp-loopback-landing | ready（薄落地：P-MCP 探针 + 快照缺口 socat 兜底 + 冲突 Warn；估 2 人日内） | — |
+| 18B mark-engine-impl | in-flight（MarkEngineImpl lane） | 05✅ |
 
 > **egress 目标形态（2026-09-27 用户裁决）**：4090 wg0 假设作废。出口 = 用户提供的真实隧道接口 或 D4 SOCKS 择型；地理身份探针（P13）在无隧道机器上恒按实红，不阻塞任何票。
 
