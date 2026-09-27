@@ -11,6 +11,7 @@
 - 版本注入实测：tag 副本 v0.1.0-1-g<hash>、-dirty 变体、tag/Cargo 不一致 panic rc=101（fail-loud）
 - workflow actionlint 1.7.12 零告警（act 本地不可跑，三 job 逐命令本地复现留档）；PKGBUILD bash -n OK（namcap 不在 nixpkgs，人工清单回退）
 - parent 复跑注记：NixOS 无 dpkg-deb（改用 nix dpkg）；稀疏 PATH 下 payload 需绝对路径（/usr/bin 无 true）——非缺陷，bundle 用户文档应注明
+- **后记（2026-09-27，依赖降级时序澄清）**：本票验证时的 Depends 含 slirp4netns (>= 1.2.0) 是当时事实；验证之后操作者质询"slirp4netns 是必须的吗"→ 依赖降级（Depends 仅 passt；slirp4netns→Suggests；tun2proxy→Recommends）由 PM 执行并随迁 worktree（ef07e97）。两版记录不矛盾：本票 Answer = 验证时点快照，现行元数据以 worktree packaging/ppa 分支为准
 
 ## 设计（来源：podman/passt 集成研究 + 本仓架构）
 
