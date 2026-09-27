@@ -43,7 +43,7 @@
 
 | 21 execrpc-nix-sandbox-test | done（2026-09-27：host_shell 解析器 + 沙箱守卫，nix build 全绿亲验） | — |
 | 22 remove-mcp-fallback | ready（21 完成后可开工） | 21✅ |
-| 23 playwright-driver-exploration | 探究待派（用户指认的典型用例：R12 浏览器驱动层，orca 之外的组合位） | — |
+| 23 playwright-driver-exploration | 探究待派（已按用户收窄：仅『会话内 Playwright 驱动宿主已登录 Chrome』用例，1235 删） | — |
 
 ## 邻位协作（herdr 双 agent，w12 workspace）——协议已接受并执行
 
