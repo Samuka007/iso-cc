@@ -2,7 +2,15 @@
 
 **What to build:** R4/D6 落地。机制件已全就位（redirect 通用面/setup 收敛/doctor 核验/manifest kind），本票补"cc 默认语义"与验收探针。
 
-**Blocked by:** 14（已完成）　**Owner:** 待派
+**Blocked by:** 14（已完成）　**Owner:** lane-cc-profile-iso（完成）
+**Status:** done（2026-09-27，parent 亲验通过）
+
+## Answer（PM 落）
+
+- 六锚全绿 + parent 复跑：nextest 103/103、clippy 干净、smoke 33/33（首次 parent 复跑 25 fail 为我漏传 `$1` 二进制路径——非回归，修正后全绿，如实记档）
+- 实现要点：BootstrapPlan rw_binds（serde 兼容）；内置对唯一出处 config::cc_builtin_pairs×3；ns.rs rw 先/ro 后（内置对可被用户 redirect 覆盖）；P8 判定核组件级前缀（防 evil-neighbor）+故障注入实测；CLAUDE_CONFIG_DIR 探针 R4/claudedir-env
+- 真机验证项（不阻塞）：真实 cc 登录 → profiles/<p>/claude/.credentials.json；/status 显示默认 ~/.claude
+- 烟测 rig：/tmp/iso-cc-exp05/smoke.sh（**需传二进制路径参数**）
 
 ## Specification
 

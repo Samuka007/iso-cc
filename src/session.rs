@@ -20,6 +20,11 @@ use std::time::{Duration, Instant};
 pub struct BootstrapPlan {
     pub mode: BootstrapMode,
     pub ipv6_off: bool,
+    /// rw bind（票 05 CC 内置对：backing → view，可写）。应用顺序先于 `binds`
+    /// （挂叠底层 = 前置语义；同挂载点后到 ro bind 覆盖）。`#[serde(default)]`
+    /// 保持旧 JSON 兼容（同 socks 键先例）。
+    #[serde(default)]
+    pub rw_binds: Vec<(String, String)>,
     pub binds: Vec<(String, String)>,
     pub iface: String,
     pub timeout_ms: u64,
@@ -196,6 +201,26 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
     }
     binds.extend(redirect_binds);
 
+    // CC 内置重定向对（票 05 / R4 / D6）：cc_isolation=true（默认）时 rw bind
+    // backing（profiles/<profile>/ 持久态）→ view（cc 默认路径）。挂载点两侧均由
+    // setup 收敛并登记（backing=profile-state，view 预创建=mountpoint）；run 期
+    // 缺失仍 fail-loud（票 14 契约不变）。false = 无内置对（共享语义，现状等价）。
+    let mut rw_binds: Vec<(PathBuf, String)> = Vec::new();
+    if profile.cc_isolation() {
+        for pair in crate::config::cc_builtin_pairs(profile_name) {
+            for (side, path) in [("backing", pair.backing.as_path()), ("view", pair.view.as_path())] {
+                if !path.exists() {
+                    bail!(
+                        "挂载点 {} 缺失（cc 内置对 {key} 的 {side}，fail-loud：run 零预创建）——先运行 `iso-cc setup` 收敛并登记",
+                        path.display(),
+                        key = pair.key
+                    );
+                }
+            }
+            rw_binds.push((pair.backing, pair.view.to_string_lossy().into_owned()));
+        }
+    }
+
     // exec RPC 通道（票 15 spec#1）：exec.bash=host 时装配（bin/bash shim 符号链接 +
     // exec.sock bind+0600）。fallible 须在网关 spawn 前——env 注入需要通道路径。
     // 网关二进制解析（fail-loud #2 清单门）须先于通道 prepare：prepare 落盘
@@ -216,6 +241,10 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
             NetGateway::Slirp4netns => BootstrapMode::Selfmap,
         },
         ipv6_off: profile.ipv6() == NetIpv6::Off,
+        rw_binds: rw_binds
+            .iter()
+            .map(|(s, d)| (s.to_string_lossy().into_owned(), d.clone()))
+            .collect(),
         binds: binds
             .iter()
             .map(|(s, d)| (s.to_string_lossy().into_owned(), d.clone()))
@@ -237,6 +266,11 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
             if let Some(tz) = &profile.locale.tz {
                 v.push(OsString::from("--expect-tz"));
                 v.push(tz.clone().into());
+            }
+            // P8 写集探针（票 05）的允许根：声明重定向集 ∪ R4 白名单 ∪ 工具状态根。
+            for root in p8_allowed_roots(profile_name, profile) {
+                v.push(OsString::from("--allow-under"));
+                v.push(root.into_os_string());
             }
             v
         }
@@ -262,6 +296,41 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
         ),
         NetGateway::Slirp4netns => spawn_slirp(ctx, profile, inner),
     }
+}
+
+/// P8 允许根（票 05）：`find $HOME -newer` 实测写集 ⊆ 允许根集（R4 核心不变式，
+/// 判定核在 probe::p8_violations）。构成：
+/// ① 工具状态根（sessions/<id>/ 资产与 profiles/ backing 是本工具自写面，声明性
+///    存在，非 cc 泄漏）；② 声明重定向集——cc_isolation=true = 内置对 view 路径，
+///    false = 宿主 cc 默认路径按声明共享；③ 用户 redirect 两侧；④ R4 写集例外
+///    白名单（probe::P8_ALLOW_UNDER，cc autoInstallIdeExtension 等取证登记）。
+fn p8_allowed_roots(profile_name: &str, profile: &Profile) -> Vec<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let home = Path::new(&home);
+    let mut roots = vec![crate::manifest::state_dir()];
+    if profile.cc_isolation() {
+        roots.extend(
+            crate::config::cc_builtin_pairs(profile_name)
+                .into_iter()
+                .map(|p| p.view),
+        );
+    } else {
+        roots.extend([
+            home.join(".claude"),
+            home.join(".claude.json"),
+            home.join(".claude.json.backup"),
+        ]);
+    }
+    for r in &profile.redirect {
+        if let Some((src, dst)) = r.split_once('=') {
+            roots.push(PathBuf::from(src));
+            roots.push(PathBuf::from(dst));
+        }
+    }
+    for w in crate::probe::P8_ALLOW_UNDER {
+        roots.push(home.join(w));
+    }
+    roots
 }
 
 /// spawn 期共享上下文：会话标识/资产目录/bootstrap plan/exec 通道（票 15）。
@@ -388,9 +457,10 @@ fn spawn_slirp(mut ctx: SpawnCtx<'_>, profile: &Profile, inner: Vec<OsString>) -
     apply_env(&mut bs, profile, exec.as_ref());
 
     // pre_exec 自映射（§1.3 下树）：binds 父进程预转换（§2.1），闭包体 = ns.rs 入口 B 单调用
+    let rw = ns::cstring_binds(&plan.rw_binds).context("rw bind 路径预转换")?;
     let binds = ns::cstring_binds(&plan.binds).context("bind 路径预转换")?;
     let expected_ppid = std::process::id();
-    ns::install_pre_exec(&mut bs, move || ns::enter_selfmap_ns(&binds, expected_ppid));
+    ns::install_pre_exec(&mut bs, move || ns::enter_selfmap_ns(&rw, &binds, expected_ppid));
     let root = bs
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -464,9 +534,10 @@ pub fn bootstrap_run(
 /// PDEATHSIG→pasta + 结构对账：spawn 模式父=pasta、pid 不可预知，父死则被 reparent 到
 /// pid 1 → 自尽；prctl 之后 pasta 死亡由内核信号覆盖。
 fn enter_mountns_inband(plan: &BootstrapPlan) -> anyhow::Result<()> {
+    let rw = ns::cstring_binds(&plan.rw_binds).context("rw bind 路径预转换")?;
     let binds = ns::cstring_binds(&plan.binds).context("bind 路径预转换")?;
     // expected_ppid=0 = 结构对账（pasta 路径父 pid 不可预知，ns.rs 入口 A）
-    ns::enter_mountns(&binds, 0).map_err(|e| anyhow!("mountns 装配（pasta 之下）失败: {e}"))
+    ns::enter_mountns(&rw, &binds, 0).map_err(|e| anyhow!("mountns 装配（pasta 之下）失败: {e}"))
 }
 
 /// 等网关 tap 就绪（provider 无关；socks 形态再等 worker tun1）→ exec 真实命令。
@@ -708,6 +779,7 @@ mod tests {
         let plan = BootstrapPlan {
             mode: BootstrapMode::Mountns,
             ipv6_off: true,
+            rw_binds: vec![("/state/profiles/p/claude".into(), "/home/u/.claude".into())],
             binds: vec![("/a".into(), "/b".into())],
             iface: provider::NS_IFNAME.into(),
             timeout_ms: 15_000,
@@ -717,7 +789,21 @@ mod tests {
         let back: BootstrapPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(back, plan);
         assert!(json.contains("\"mode\":\"mountns\""), "{json}");
+        assert!(
+            json.contains("\"rw_binds\":[[\"/state/profiles/p/claude\",\"/home/u/.claude\"]]"),
+            "{json}"
+        );
         assert!(json.contains("[[\"/a\",\"/b\"]]"), "{json}");
+    }
+
+    #[test]
+    fn bootstrap_plan_old_json_without_rw_binds_compat() {
+        // 票 05 新键 rw_binds 走 serde(default)：旧 plan JSON（无该键）仍可解析
+        let old: BootstrapPlan = serde_json::from_str(
+            r#"{"mode":"mountns","ipv6_off":true,"binds":[],"iface":"tap0","timeout_ms":15000}"#,
+        )
+        .unwrap();
+        assert!(old.rw_binds.is_empty());
     }
 
     #[test]
@@ -741,6 +827,7 @@ mod tests {
         let plan = BootstrapPlan {
             mode: BootstrapMode::Selfmap,
             ipv6_off: false,
+            rw_binds: vec![],
             binds: vec![],
             iface: provider::NS_IFNAME.into(),
             timeout_ms: 15_000,
@@ -755,6 +842,7 @@ mod tests {
         let plan = BootstrapPlan {
             mode: BootstrapMode::Mountns,
             ipv6_off: true,
+            rw_binds: vec![],
             binds: vec![],
             iface: provider::NS_IFNAME.into(),
             timeout_ms: 15_000,
@@ -797,5 +885,24 @@ mod tests {
             }
             other => panic!("应为 socks 形态: {other:?}"),
         }
+    }
+
+    #[test]
+    fn p8_roots_declare_redirect_set_by_axis() {
+        // 票 05：允许根 = 工具状态根 ∪ 声明集 ∪ redirect 两侧 ∪ R4 白名单。
+        // true 轴声明集 = 内置对 view；false 轴 = 宿主 cc 默认路径（声明共享）。
+        let on: Profile =
+            toml::from_str("egress = 'if:wg0'\nredirect = ['/data/notes=/home/u/notes']").unwrap();
+        let roots = p8_allowed_roots("ccx", &on);
+        let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()));
+        assert!(roots.contains(&crate::manifest::state_dir()));
+        assert!(roots.contains(&home.join(".claude")));
+        assert!(roots.contains(&PathBuf::from("/data/notes")));
+        assert!(roots.contains(&home.join(".vscode/extensions")));
+
+        let off: Profile = toml::from_str("egress = 'if:wg0'\nagent.cc_isolation = false").unwrap();
+        let roots = p8_allowed_roots("ccx", &off);
+        // false 轴：宿主默认路径仍声明（共享语义），内置对 view 不再来自声明集
+        assert!(roots.contains(&home.join(".claude.json")));
     }
 }

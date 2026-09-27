@@ -105,6 +105,9 @@ enum Commands {
         /// 期望时区（声明值）
         #[arg(long)]
         expect_tz: Option<String>,
+        /// P8 允许根（票 05）：声明重定向集 ∪ R4 白名单 ∪ 工具状态根，spawn 侧推导
+        #[arg(long = "allow-under")]
+        allow_under: Vec<std::path::PathBuf>,
     },
     /// 内部：会话引导（等 tap0 → 配网 → exec）
     #[command(hide = true)]
@@ -171,8 +174,11 @@ fn run() -> anyhow::Result<()> {
         }),
         Some(Commands::List { json, .. }) => cmd_list(json),
         Some(Commands::Verify { profile, config }) => cmd_verify(profile, config),
-        Some(Commands::ProbeJson { expect_tz }) => {
-            let probes = probe::run(expect_tz.as_deref().unwrap_or("UTC"));
+        Some(Commands::ProbeJson {
+            expect_tz,
+            allow_under,
+        }) => {
+            let probes = probe::run(expect_tz.as_deref().unwrap_or("UTC"), &allow_under);
             println!("{}", probe::to_json(&probes)?);
             eprint!("{}", probe::render_human(&probes));
             if probe::any_fail(&probes) {

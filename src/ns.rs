@@ -14,9 +14,13 @@ use std::process::Command;
 use nix::mount::{mount, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 
-/// 入口 A（primary，pasta spawn 之下，§1.3 上树）：仅 CLONE_NEWNS + rprivate + bind_ro +
-/// PDEATHSIG 对账。CLONE_NEWUSER|NEWNET 建立与 uid_map 映射面不在本入口——pasta spawn
-/// 自建 userns/netns 并内建映射（E2），该面移出入口 A（§2.3 收缩幅度）。
+/// 入口 A（primary，pasta spawn 之下，§1.3 上树）：仅 CLONE_NEWNS + rprivate +
+/// rw/ro bind + PDEATHSIG 对账。CLONE_NEWUSER|NEWNET 建立与 uid_map 映射面不在本
+/// 入口——pasta spawn 自建 userns/netns 并内建映射（E2），该面移出入口 A（§2.3
+/// 收缩幅度）。
+///
+/// 应用顺序 = `rw_binds` 先、`binds`（ro）后：票 05 内置对是挂叠底层（前置），
+/// 同挂载点上的后到 bind（用户 redirect）覆盖先到——声明精细者胜。
 ///
 /// # SAFETY(入口)
 ///
@@ -26,12 +30,20 @@ use nix::sched::{unshare, CloneFlags};
 /// `expected_ppid` = PDEATHSIG 对账基准：非 0 → 精确对账（`getppid()` 必须等于该值）；
 /// 0 → 结构对账（pasta spawn 路径父 pid 不可预知：`getppid() == 1` 即已 reparent 到
 /// init = 原父已死）。不符一律 kill(self) 自尽（PR_SET_PDEATHSIG(2const) 竞态②）。
-pub fn enter_mountns(binds: &[(CString, CString)], expected_ppid: u32) -> io::Result<()> {
+pub fn enter_mountns(
+    rw_binds: &[(CString, CString)],
+    binds: &[(CString, CString)],
+    expected_ppid: u32,
+) -> io::Result<()> {
     set_pdeathsig_verified(libc::SIGKILL, expected_ppid)?;
     // SAFETY: 单线程 pre_exec/bootstrap 早期；CLONE_NEWNS 仅需调用者位于目标 userns（入口保证）
     unsafe { unshare_mountns()? };
     // SAFETY: mount(2) 于本 ns；MS_REC|MS_PRIVATE 不产生宿主可见变化（mountns 私有）
     unsafe { make_root_private()? };
+    for (src, dst) in rw_binds {
+        // SAFETY: 两次 mount(2)；dst 存在性由 run 期挂载点预创建断言保证
+        unsafe { bind_rw(src, dst)? };
+    }
     for (src, dst) in binds {
         // SAFETY: 两次 mount(2)；dst 存在性由 run 期挂载点预创建断言保证
         unsafe { bind_ro(src, dst)? };
@@ -39,15 +51,21 @@ pub fn enter_mountns(binds: &[(CString, CString)], expected_ppid: u32) -> io::Re
     Ok(())
 }
 
-/// 入口 B（slirp4netns 回退专用，§1.3 下树）：三 ns 自建（CLONE_NEWUSER|NEWNS|NEWNET）+
-/// 单条自映射 + rprivate + bind_ro。parent 永不写 /proc/<pid>/maps（Facts §3 残留源消灭），
-/// 自映射在本入口内 pre_exec 期完成（竞态面消失，父死 = 无窗口）。
+/// 入口 B（slirp4netns 回退专用，§1.3 下树）：三 ns 自建（CLONE_NEWUSER|NEWNS|NEWNET）
+/// 加单条自映射、rprivate、rw/ro bind。parent 永不写 /proc/<pid>/maps（Facts §3
+/// 残留源消灭），自映射在本入口内 pre_exec 期完成（竞态面消失，父死 = 无窗口）。
+///
+/// 应用顺序同入口 A（rw 先、ro 后）。
 ///
 /// # SAFETY(入口)
 ///
 /// 仅 pre_exec（fork 后 exec 前）单线程上下文调用（CLONE_NEWUSER 对多线程进程失败）；
 /// `binds` 已预转换；`expected_ppid` = spawn 时刻父 pid（iso-cc 直接 spawn，精确已知）。
-pub fn enter_selfmap_ns(binds: &[(CString, CString)], expected_ppid: u32) -> io::Result<()> {
+pub fn enter_selfmap_ns(
+    rw_binds: &[(CString, CString)],
+    binds: &[(CString, CString)],
+    expected_ppid: u32,
+) -> io::Result<()> {
     // 自映射行需要 unshare 时刻的真实（parent ns）uid/gid：unshare(CLONE_NEWUSER) 之后
     // 尚无 uid_map，getuid()/getgid() 呈未映射 overflow uid（65534），不可作映射源
     // SAFETY: getuid(2)/getgid(2) AS-safe；libc 声明为 unsafe extern（仅属性读取）
@@ -61,6 +79,10 @@ pub fn enter_selfmap_ns(binds: &[(CString, CString)], expected_ppid: u32) -> io:
     unsafe { write_self_ugid_map(uid, gid)? };
     // SAFETY: mount(2) 于本 ns；MS_REC|MS_PRIVATE 不产生宿主可见变化（mountns 私有）
     unsafe { make_root_private()? };
+    for (src, dst) in rw_binds {
+        // SAFETY: 两次 mount(2)；dst 存在性由 run 期挂载点预创建断言保证
+        unsafe { bind_rw(src, dst)? };
+    }
     for (src, dst) in binds {
         // SAFETY: 两次 mount(2)；dst 存在性由 run 期挂载点预创建断言保证
         unsafe { bind_ro(src, dst)? };
@@ -148,6 +170,21 @@ unsafe fn bind_ro(src: &CString, dst: &CString) -> io::Result<()> {
         dst.as_c_str(),
         None::<&CStr>,
         MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+        None::<&CStr>,
+    )
+    .map_err(|_| io::Error::last_os_error())
+}
+
+/// rw bind（票 05 CC 内置对）：单次 mount(BIND)，不 REMOUNT——可写性继承底层挂载，
+/// cc 对默认路径的写（credentials/会话史）经 bind 落 profile 持久态。
+///
+/// SAFETY: 单次 mount(2)；dst 存在性由 run 期挂载点预创建断言保证。
+unsafe fn bind_rw(src: &CString, dst: &CString) -> io::Result<()> {
+    mount(
+        Some(src.as_c_str()),
+        dst.as_c_str(),
+        None::<&CStr>,
+        MsFlags::MS_BIND,
         None::<&CStr>,
     )
     .map_err(|_| io::Error::last_os_error())

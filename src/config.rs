@@ -195,6 +195,55 @@ pub struct Agent {
     pub command: Option<String>,
     /// advisory：不匹配仅警告（D3：宿主管理 + 声明式定义）。
     pub version: Option<String>,
+    /// CC 配置隔离轴（票 05 / R4 / D6）：true（默认）= 会话自动前置内置重定向对
+    /// （`~/.claude/`、`~/.claude.json(.backup)` → `<state>/profiles/<profile>/`，
+    /// rw bind + 会话内 unset CLAUDE_CONFIG_DIR）；false = 无内置对，与宿主共享
+    /// cc 默认路径（显式声明的共享语义，行为与票 05 之前等价）。
+    #[serde(default)]
+    pub cc_isolation: Option<bool>,
+}
+
+/// CC 内置重定向对（票 05 / R4 / D6 声明集）：会话内 view 路径（cc 默认路径，
+/// 完全无感）由 backing 路径（profile 持久态，登录态/会话史跨会话存续）rw bind
+/// 支撑；clean-room 默认不继承宿主 `~/.claude`。`key` = manifest profile-state
+/// 登记名（gc 仅随显式 `--profile` 回收）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CcBuiltinPair {
+    pub view: PathBuf,
+    pub backing: PathBuf,
+    /// backing 形态（setup mkdir/touch 依据；声明即事实，不探测宿主）。
+    pub backing_is_dir: bool,
+    pub key: &'static str,
+}
+
+/// 内置对全集（声明集唯一出处：session 前置 bind / setup 收敛 / doctor 核验 /
+/// plan 展开共用；新增路径 = 补此处 + 测试夹具，ADR 0006 泄漏捕获路径）。
+pub fn cc_builtin_pairs(profile_name: &str) -> Vec<CcBuiltinPair> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let home = Path::new(&home);
+    let base = crate::manifest::state_dir()
+        .join("profiles")
+        .join(profile_name);
+    vec![
+        CcBuiltinPair {
+            view: home.join(".claude"),
+            backing: base.join("claude"),
+            backing_is_dir: true,
+            key: "claude",
+        },
+        CcBuiltinPair {
+            view: home.join(".claude.json"),
+            backing: base.join("claude.json"),
+            backing_is_dir: false,
+            key: "claude.json",
+        },
+        CcBuiltinPair {
+            view: home.join(".claude.json.backup"),
+            backing: base.join("claude.json.backup"),
+            backing_is_dir: false,
+            key: "claude.json.backup",
+        },
+    ]
 }
 
 impl Profile {
@@ -223,6 +272,11 @@ impl Profile {
     /// 生效 bash 执行位置（未声明 = sandbox，行为与现状等价）。
     pub fn exec_bash(&self) -> ExecBash {
         self.exec.bash.unwrap_or(ExecBash::Sandbox)
+    }
+
+    /// 生效 CC 配置隔离（未声明 = true，票 05 默认内置重定向对）。
+    pub fn cc_isolation(&self) -> bool {
+        self.agent.cc_isolation.unwrap_or(true)
     }
 
     /// 生效 IPv6 策略（未声明 = off，fail-closed）。
@@ -504,6 +558,55 @@ agent.command = "claude"
         )
         .expect_err("exec 节未知键必须 fail-loud");
         assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn cc_isolation_defaults_true() {
+        // 票 05：默认内置重定向对——未声明 = true
+        let cfg: Config = toml::from_str("version = 1\n[profile.x]\negress = 'if:wg0'").unwrap();
+        assert!(cfg.profile.get("x").unwrap().cc_isolation());
+    }
+
+    #[test]
+    fn cc_isolation_false_axis_parses() {
+        let cfg: Config = toml::from_str(
+            "version = 1\n[profile.x]\negress = 'if:wg0'\nagent.cc_isolation = false",
+        )
+        .unwrap();
+        assert!(!cfg.profile.get("x").unwrap().cc_isolation());
+        let cfg: Config = toml::from_str(
+            "version = 1\n[profile.x]\negress = 'if:wg0'\nagent.cc_isolation = true",
+        )
+        .unwrap();
+        assert!(cfg.profile.get("x").unwrap().cc_isolation());
+    }
+
+    #[test]
+    fn unknown_agent_field_rejected() {
+        let err = toml::from_str::<Config>(
+            "version = 1\n[profile.x]\negress = 'if:wg0'\nagent.pinned = true",
+        )
+        .expect_err("agent 节未知键必须 fail-loud");
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn cc_builtin_pairs_shape() {
+        // 声明集唯一出处的形态锚：三对 view/backing/key/backing_is_dir
+        let pairs = cc_builtin_pairs("ccx");
+        assert_eq!(pairs.len(), 3);
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        let base = crate::manifest::state_dir().join("profiles").join("ccx");
+        assert_eq!(pairs[0].view, std::path::PathBuf::from(&home).join(".claude"));
+        assert_eq!(pairs[0].backing, base.join("claude"));
+        assert!(pairs[0].backing_is_dir);
+        assert_eq!(pairs[0].key, "claude");
+        assert_eq!(pairs[1].view, std::path::PathBuf::from(&home).join(".claude.json"));
+        assert_eq!(pairs[1].backing, base.join("claude.json"));
+        assert!(!pairs[1].backing_is_dir);
+        assert_eq!(pairs[2].view, std::path::PathBuf::from(&home).join(".claude.json.backup"));
+        assert_eq!(pairs[2].backing, base.join("claude.json.backup"));
+        assert!(!pairs[2].backing_is_dir);
     }
 
     #[test]

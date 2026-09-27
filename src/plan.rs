@@ -45,7 +45,7 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
                 "1. gateway=pasta spawn (session root): pasta {flags} -- <iso-cc> session-bootstrap --plan <json> --session-id <session-id> -- <cmd>"
             ));
             v.push(
-                "2. bootstrap(mode=mountns): PDEATHSIG->pasta + getppid check; unshare CLONE_NEWNS; rprivate /; bind_ro x N".into(),
+                "2. bootstrap(mode=mountns): PDEATHSIG->pasta + getppid check; unshare CLONE_NEWNS; rprivate /; bind_rw x M + bind_ro x N".into(),
             );
             if let Some((_, port)) = &socks {
                 let worker_flags = provider::socks::worker_args_for_url(format!(
@@ -74,7 +74,7 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
                     .into(),
             );
             v.push(
-                "2. bootstrap(mode=selfmap): parent pre_exec unshare CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWNET + self single-entry maps + rprivate + binds + PDEATHSIG->iso-cc (parent never writes /proc/<pid>/maps)".into(),
+                "2. bootstrap(mode=selfmap): parent pre_exec unshare CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWNET + self single-entry maps + rprivate + rw/ro binds + PDEATHSIG->iso-cc (parent never writes /proc/<pid>/maps)".into(),
             );
         }
     }
@@ -90,6 +90,26 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
     v.push(format!(
         "4. bind sessions/<id>/resolv.conf -> /etc/resolv.conf (nameserver {dns})"
     ));
+    // 票 05（R4/D6）：内置对展开可见——rw bind backing（profile 持久态）→ view（cc 默认路径）
+    if p.cc_isolation() {
+        v.push(
+            "4c. cc_isolation=true (R4/D6): builtin rw binds, backing = profiles/<p>/ persistent state (clean-room, cross-session); unset CLAUDE_CONFIG_DIR in session env"
+                .into(),
+        );
+        for (i, pair) in crate::config::cc_builtin_pairs(profile_name).into_iter().enumerate() {
+            v.push(format!(
+                "4c{}. rw bind {} -> {}",
+                i + 1,
+                pair.backing.display(),
+                pair.view.display()
+            ));
+        }
+    } else {
+        v.push(
+            "4c. cc_isolation=false: no builtin pairs (host ~/.claude* shared = declared semantics)"
+                .into(),
+        );
+    }
     for r in &p.redirect {
         let (src, dst) = r.split_once('=').unwrap_or((r.as_str(), "?"));
         v.push(format!("5. bind {src} -> {dst}"));
@@ -297,5 +317,34 @@ mod tests {
         assert!(joined.contains("gateway=pasta"), "{joined}");
         // socks 形态禁止显式 outbound（--outbound-if4 使 map-host-loopback 映射失效）
         assert!(!joined.contains("--outbound-if4"), "{joined}");
+    }
+
+    #[test]
+    fn cc_isolation_plan_expands_builtin_pairs() {
+        // 票 05：内置对展开可见（backing = profile 持久态 → view = cc 默认路径）
+        let p = prof("egress = 'if:wg0'");
+        let lines = plan_lines("ccx", &p, None);
+        let joined = lines.join("\n");
+        assert!(joined.contains("4c. cc_isolation=true"), "{joined}");
+        assert!(joined.contains("unset CLAUDE_CONFIG_DIR"), "{joined}");
+        for key in ["claude", "claude.json", "claude.json.backup"] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("4c")
+                        && l.contains("rw bind ")
+                        && l.contains(&format!("profiles/ccx/{key}"))),
+                "缺 {key} 展开: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cc_isolation_false_plan_has_no_builtin_bind() {
+        let p = prof("egress = 'if:wg0'\nagent.cc_isolation = false");
+        let lines = plan_lines("ccx", &p, None);
+        let joined = lines.join("\n");
+        assert!(joined.contains("4c. cc_isolation=false"), "{joined}");
+        assert!(!joined.contains("rw bind"), "false 轴不得出现内置对: {joined}");
     }
 }

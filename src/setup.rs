@@ -18,6 +18,8 @@ use std::path::Path;
 const REASON_PROVIDER: &str = "R11/D7 provider 钉路径（票 14 清单态，替换 09 期 which 过渡）";
 /// mountpoint 条目登记理由（N3 例外①移至 setup 期）。
 const REASON_MOUNTPOINT: &str = "N3 例外① setup 期创建并登记（spec 变更（一）setup-manifested，票 14）";
+/// profile-state 条目登记理由（票 05：CC profile 持久态，gc 仅随显式 --profile）。
+const REASON_PROFILE_STATE: &str = "R4/D6 CC profile 持久态（票 05；gc 仅随显式 --profile 回收）";
 
 /// 单条收敛动作（人类可读行 + `--json` 数组元素共用）。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -29,6 +31,11 @@ pub struct Action {
 /// mountpoint key：`<profile>:<dst>`（stale 判定 + gc --profile 定界的定界符）。
 pub fn mountpoint_key(profile_name: &str, dst: &str) -> String {
     format!("{profile_name}:{dst}")
+}
+
+/// profile-state key：`<profile>:<内置对 key>`（gc --profile 定界与 stale 判定同构）。
+pub fn profile_state_key(profile_name: &str, key: &str) -> String {
+    format!("{profile_name}:{key}")
 }
 
 /// 挂载点创建形态：bind src 是目录 → mkdir -p(dst)；否则 touch 空文件。
@@ -109,6 +116,66 @@ pub fn converge(profile_name: &str, profile: &Profile) -> anyhow::Result<(Vec<Ac
         }
     }
 
+    // ②a CC 内置对收敛（票 05 / R4 / D6）：cc_isolation=true（默认）时——
+    //    backing（profiles/<profile>/ 持久态）缺失创建 + 登记 profile-state
+    //    （insert_new_only 兼作清单丢失自愈；重跑双 false → action diff=0）；
+    //    view（cc 默认路径）缺失预创建 + 登记 mountpoint（D6/N3 有界宿主痕迹；
+    //    预存在路径非本工具所有，不纳管）。
+    if profile.cc_isolation() {
+        for pair in crate::config::cc_builtin_pairs(profile_name) {
+            let created = if !pair.backing.exists() {
+                if pair.backing_is_dir {
+                    std::fs::create_dir_all(&pair.backing)
+                        .with_context(|| format!("创建 CC backing 目录 {}", pair.backing.display()))?;
+                } else {
+                    std::fs::write(&pair.backing, b"")
+                        .with_context(|| format!("创建 CC backing 文件 {}", pair.backing.display()))?;
+                }
+                true
+            } else {
+                false
+            };
+            let inserted = manifest.insert_new_only(Entry {
+                kind: EntryKind::ProfileState,
+                key: profile_state_key(profile_name, pair.key),
+                path: Some(pair.backing.clone()),
+                version: None,
+                registered_at: manifest::now_millis(),
+                reason: REASON_PROFILE_STATE.into(),
+            });
+            if created || inserted {
+                actions.push(Action {
+                    target: format!("profile-state {}", pair.backing.display()),
+                    detail: format!(
+                        "{}（cc 内置对 {key}；view={}）",
+                        if created { "mkdir/touch" } else { "登记（清单自愈）" },
+                        pair.view.display(),
+                        key = pair.key
+                    ),
+                });
+            }
+            if !pair.view.exists() {
+                let how = create_mountpoint(&pair.backing, &pair.view)?;
+                manifest.insert_new_only(Entry {
+                    kind: EntryKind::Mountpoint,
+                    key: mountpoint_key(profile_name, &pair.view.to_string_lossy()),
+                    path: Some(pair.view.clone()),
+                    version: None,
+                    registered_at: manifest::now_millis(),
+                    reason: REASON_MOUNTPOINT.into(),
+                });
+                actions.push(Action {
+                    target: format!("mountpoint {}", pair.view.display()),
+                    detail: format!(
+                        "{how}（cc 内置对 {key} view；backing={}）",
+                        pair.backing.display(),
+                        key = pair.key
+                    ),
+                });
+            }
+        }
+    }
+
     // ③ manifest 重建 + 原子写。
     manifest::save(&manifest).context("manifest 原子落盘")?;
     Ok((actions, manifest.entries.len()))
@@ -149,6 +216,13 @@ mod tests {
         let key = mountpoint_key("web", "/tmp/x");
         let (profile, dst) = key.split_once(':').unwrap();
         assert_eq!((profile, dst), ("web", "/tmp/x"));
+    }
+
+    #[test]
+    fn profile_state_key_scopes_profile() {
+        // 票 05：profile-state key 与 mountpoint key 同构（gc --profile 定界共用）
+        assert_eq!(profile_state_key("ccx", "claude"), "ccx:claude");
+        assert_eq!(profile_state_key("ccx", "claude.json"), "ccx:claude.json");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use anyhow::Context;
 use serde::Serialize;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -56,9 +57,73 @@ fn parse_zz(s: &str) -> Option<i64> {
     Some(h * 3600 + m * 60)
 }
 
+/// P8 写集白名单（票 05 / R4 写集例外登记）：cc 已知写在本工具声明重定向集之外的
+/// `$HOME` 路径。`autoInstallIdeExtension` 写 `~/.vscode/extensions`；Chrome native
+/// messaging manifest 写浏览器配置目录（R4 取证登记）。`/etc/claude-code/managed-
+/// settings.json` 是只读渗入（非写点），不入列。发现新写点 = 登记 + 补默认绑定。
+pub const P8_ALLOW_UNDER: &[&str] = &[
+    ".vscode/extensions",
+    ".config/google-chrome",
+    ".config/chromium",
+    ".config/microsoft-edge",
+    ".mozilla",
+];
+
+/// P8 判定核（纯函数，票 05 单测锚）：实测写集中落在任何允许根之外的路径。
+/// 允许语义 = 路径等于根或为根的子孙（Path 组件级前缀，杜绝字符串前缀误放行
+/// `.vscode/extensions-evil` 这类邻居）。
+pub fn p8_violations(write_set: &[PathBuf], allowed_roots: &[PathBuf]) -> Vec<PathBuf> {
+    write_set
+        .iter()
+        .filter(|p| !allowed_roots.iter().any(|root| p.starts_with(root)))
+        .cloned()
+        .collect()
+}
+
+/// P8 实测写集（会话内）：`find $HOME -newer <marker>`。marker 由调用方创建于
+/// `$HOME` 之外（/tmp），find 输出逐行 = 路径。None = find 不可用（Skip 语义）。
+fn p8_write_set(home: &Path, marker: &Path) -> Option<Vec<PathBuf>> {
+    let (code, out) = sh_out(
+        "find",
+        &[
+            home.to_str()?,
+            "-newer",
+            marker.to_str()?,
+            "-print",
+        ],
+    )?;
+    (code == 0).then(|| {
+        out.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(PathBuf::from)
+            .collect()
+    })
+}
+
 /// 会话内纯净度探针 v0.2（T5 ①子集）。上下文：netns+mountns+locale 注入齐备。
-pub fn run(declared_tz: &str) -> Vec<Probe> {
+pub fn run(declared_tz: &str, allow_under: &[PathBuf]) -> Vec<Probe> {
     let mut out = Vec::new();
+
+    // R4 探针断言（票 05 spec#3）：会话内 CLAUDE_CONFIG_DIR 必须已 unset——
+    // 防宿主环境把 cc 引向声明重定向集之外的第三处（ADR 0006）。
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        None => out.push(Probe::new(
+            "R4/claudedir-env",
+            Verdict::Pass,
+            "CLAUDE_CONFIG_DIR 已 unset（会话 env）",
+        )),
+        Some(v) => out.push(Probe::new(
+            "R4/claudedir-env",
+            Verdict::Fail,
+            format!("CLAUDE_CONFIG_DIR={v:?} 未 unset（R4：会话 env 必须摘除）"),
+        )),
+    }
+
+    // P8 marker（票 05 spec#4）：先于全部探针落 /tmp（$HOME 之外），find 在套件
+    // 收尾执行——写集观察窗覆盖整个探针期（结构不变式的实测面）。
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()));
+    let marker = std::env::temp_dir().join(format!("iso-cc-p8-marker-{}", std::process::id()));
+    let marker_ok = std::fs::write(&marker, b"").is_ok();
 
     // 期望偏移：由内嵌 tzdb 独立推导（与 glibc 视线互为交叉验证）
     let expect_offset = tzdb::tz_by_name(declared_tz).and_then(|tz| {
@@ -248,6 +313,48 @@ pub fn run(declared_tz: &str) -> Vec<Probe> {
         )),
     }
 
+    // P8 写集探针判定（套件收尾执行 find）：实测写集 ⊆ 声明重定向集 ∪ 白名单
+    // （允许根由 spawn 侧按声明推导注入）。白名单外出现即 Fail（R4 核心不变式）。
+    match (marker_ok, p8_write_set(&home, &marker)) {
+        (true, Some(write_set)) => {
+            let violations = p8_violations(&write_set, allow_under);
+            if violations.is_empty() {
+                out.push(Probe::new(
+                    "P8/write-set",
+                    Verdict::Pass,
+                    format!(
+                        "写集 {} 条 ⊆ 允许根 {} 条（声明重定向集 ∪ R4 白名单 ∪ 工具状态根）",
+                        write_set.len(),
+                        allow_under.len()
+                    ),
+                ));
+            } else {
+                let shown: Vec<String> = violations
+                    .iter()
+                    .take(5)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                out.push(Probe::new(
+                    "P8/write-set",
+                    Verdict::Fail,
+                    format!(
+                        "白名单外写集 ×{}：{}{}（R4 不变式：先补默认绑定 + 白名单登记）",
+                        violations.len(),
+                        shown.join(", "),
+                        if violations.len() > 5 { " …" } else { "" }
+                    ),
+                ));
+            }
+        }
+        (true, None) => out.push(Probe::new("P8/write-set", Verdict::Skip, "find 不可用")),
+        (false, _) => out.push(Probe::new(
+            "P8/write-set",
+            Verdict::Skip,
+            "marker 创建失败（/tmp 不可写）",
+        )),
+    }
+    let _ = std::fs::remove_file(&marker);
+
     eprintln!("[iso-cc probe] suite done");
     out
 }
@@ -281,4 +388,57 @@ pub fn render_human(probes: &[Probe]) -> String {
 /// JSON 序列化入口（verify 的机器可读输出）
 pub fn to_json(probes: &[Probe]) -> anyhow::Result<String> {
     serde_json::to_string_pretty(probes).context("序列化探针结果")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roots(base: &Path) -> Vec<PathBuf> {
+        vec![
+            base.join(".claude"),
+            base.join(".claude.json"),
+            base.join(".local/state/iso-cc"),
+            base.join(".vscode/extensions"),
+        ]
+    }
+
+    #[test]
+    fn p8_passes_write_inside_declared_or_whitelist() {
+        let home = PathBuf::from("/home/u");
+        let ws = vec![
+            home.join(".claude/foo"),                       // 内置对 view 内
+            home.join(".claude/projects/x.jsonl"),          // view 孙路径
+            home.join(".claude.json"),                      // 等于根
+            home.join(".local/state/iso-cc/sessions/s/gateway.log"), // 工具状态根
+            home.join(".vscode/extensions/pub.ext"),        // R4 白名单
+        ];
+        assert!(p8_violations(&ws, &roots(&home)).is_empty());
+    }
+
+    #[test]
+    fn p8_fails_write_outside_allowlist() {
+        let home = PathBuf::from("/home/u");
+        let ws = vec![
+            home.join(".config/some-tool/conf.toml"), // 白名单外
+            home.join(".ssh/known_hosts"),            // 白名单外
+        ];
+        let v = p8_violations(&ws, &roots(&home));
+        assert_eq!(v, ws, "白名单外写集必须逐条上报（R4 核心不变式）");
+    }
+
+    #[test]
+    fn p8_component_boundary_no_string_prefix_escape() {
+        // 组件级前缀：`.vscode/extensions-evil` 不是 `.vscode/extensions` 的子孙
+        let home = PathBuf::from("/home/u");
+        let ws = vec![home.join(".vscode/extensions-evil/x"), home.join(".claudej")];
+        let v = p8_violations(&ws, &roots(&home));
+        assert_eq!(v.len(), 2, "{v:?}");
+    }
+
+    #[test]
+    fn p8_empty_write_set_passes() {
+        let home = PathBuf::from("/home/u");
+        assert!(p8_violations(&[], &roots(&home)).is_empty());
+    }
 }

@@ -176,7 +176,7 @@ fn routes_for(iface: &str) -> Option<Vec<String>> {
 /// 全量 doctor：返回检查清单（任何 Fail → 调用方 exit 1，fail-loud）。
 pub fn run(
     _cfg: &Config,
-    _profile_name: &str,
+    profile_name: &str,
     profile: &Profile,
     sys: &dyn SysInspect,
 ) -> Vec<Check> {
@@ -496,6 +496,104 @@ pub fn run(
                     ),
                 ));
             }
+            // forward：profile-state 条目存在性（票 05：CC profile 持久态；缺失 Fail =
+            // setup 未跑或被删——profile 目录是登录态/会话史载体，消失 = 会话状态丢）
+            let ps_missing: Vec<String> = entries
+                .iter()
+                .filter(|e| e.kind == crate::manifest::EntryKind::ProfileState)
+                .filter(|e| e.path.as_ref().is_some_and(|p| !sys.path_exists(p)))
+                .map(|e| e.key.clone())
+                .collect();
+            let ps_total = entries
+                .iter()
+                .filter(|e| e.kind == crate::manifest::EntryKind::ProfileState)
+                .count();
+            if ps_missing.is_empty() {
+                out.push(Check::new(
+                    "manifest/profile-state",
+                    Status::Ok,
+                    format!("{ps_total} profile-state 条目全部在位"),
+                ));
+            } else {
+                out.push(Check::new(
+                    "manifest/profile-state",
+                    Status::Fail,
+                    format!(
+                        "profile-state 消失 ×{}：{}（setup 未跑或被删——重跑 `iso-cc setup`）",
+                        ps_missing.len(),
+                        ps_missing.join(", ")
+                    ),
+                ));
+            }
+            // CC 内置对核验（票 05 spec#5，存在性/登记一致性）：cc_isolation=true（默认）
+            // 时 backing 须存在且登记为 profile-state（路径一致）；view 须存在或已登记
+            // mountpoint（宿主跑过 cc = 预存在不纳管）。false = 无内置对（声明共享）。
+            if profile.cc_isolation() {
+                let mut problems: Vec<String> = Vec::new();
+                for pair in crate::config::cc_builtin_pairs(profile_name) {
+                    let key = crate::setup::profile_state_key(profile_name, pair.key);
+                    match entries
+                        .iter()
+                        .find(|e| e.kind == crate::manifest::EntryKind::ProfileState && e.key == key)
+                    {
+                        None => problems.push(format!(
+                            "{} backing {} 未登记（setup 未跑）",
+                            pair.key,
+                            pair.backing.display()
+                        )),
+                        Some(e) if e.path.as_deref() != Some(pair.backing.as_path()) => {
+                            problems.push(format!(
+                                "{} 登记路径漂移：{} ≠ config 推导 {}",
+                                pair.key,
+                                e.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                                pair.backing.display()
+                            ));
+                        }
+                        Some(_) if !sys.path_exists(&pair.backing) => {
+                            problems.push(format!(
+                                "{} backing {} 消失（重跑 `iso-cc setup`）",
+                                pair.key,
+                                pair.backing.display()
+                            ));
+                        }
+                        Some(_) => {}
+                    }
+                    let view_registered = entries.iter().any(|e| {
+                        e.kind == crate::manifest::EntryKind::Mountpoint
+                            && e.path.as_ref() == Some(&pair.view)
+                    });
+                    if !sys.path_exists(&pair.view) && !view_registered {
+                        problems.push(format!(
+                            "{} view {} 缺失且未登记（run 将 fail-loud）——先运行 `iso-cc setup`",
+                            pair.key,
+                            pair.view.display()
+                        ));
+                    }
+                }
+                if problems.is_empty() {
+                    out.push(Check::new(
+                        "manifest/cc-builtin",
+                        Status::Ok,
+                        "cc 内置对 ×3 全部在位且登记一致（profile-state 持久态）",
+                    ));
+                } else {
+                    out.push(Check::new(
+                        "manifest/cc-builtin",
+                        Status::Fail,
+                        format!(
+                            "cc 内置对不一致 ×{}：{}（重跑 `iso-cc setup` 收敛）",
+                            problems.len(),
+                            problems.join("; ")
+                        ),
+                    ));
+                }
+            } else {
+                out.push(Check::new(
+                    "manifest/cc-builtin",
+                    Status::Ok,
+                    "cc_isolation=false：无内置对（与宿主共享 = 声明语义）",
+                ));
+            }
             // reverse：stale 条目（指向已消失 profile）= Warn + prune 提示
             let stale: Vec<String> = entries
                 .iter()
@@ -706,7 +804,25 @@ mod tests {
     }
 
     fn default_manifest() -> Vec<crate::manifest::Entry> {
+        // 票 05 起：cc_isolation 默认 true → 稳态清单含 profile-state（cc_builtin_pairs 推导）
         vec![mentry("pasta", "/usr/bin/fake", Some("1.0.0"))]
+            .into_iter()
+            .chain(ps_entries("x"))
+            .collect()
+    }
+
+    fn ps_entries(profile_name: &str) -> Vec<crate::manifest::Entry> {
+        crate::config::cc_builtin_pairs(profile_name)
+            .into_iter()
+            .map(|pair| crate::manifest::Entry {
+                kind: crate::manifest::EntryKind::ProfileState,
+                key: crate::setup::profile_state_key(profile_name, pair.key),
+                path: Some(pair.backing),
+                version: None,
+                registered_at: 1_760_000_000_000,
+                reason: "测试登记".into(),
+            })
+            .collect()
     }
 
     /// 最小 FakeSys：全部通过的基线，单测按需覆写。
@@ -987,11 +1103,16 @@ mod tests {
     fn slirp_gateway_selection_and_dns_warn() {
         let p: Profile = toml::from_str("egress = 'if:wg0'\nnet.gateway = 'slirp4netns'").unwrap();
         let sys = FakeSys {
-            manifest: Ok(Some(vec![mentry(
-                "slirp4netns",
-                "/usr/bin/fake",
-                Some("1.0.0"),
-            )])),
+            manifest: Ok(Some(
+                vec![mentry(
+                    "slirp4netns",
+                    "/usr/bin/fake",
+                    Some("1.0.0"),
+                )]
+                .into_iter()
+                .chain(ps_entries("x"))
+                .collect(),
+            )),
             ..Default::default()
         };
         let checks = run(
@@ -1036,6 +1157,77 @@ mod tests {
     }
 
     #[test]
+    fn cc_builtin_unregistered_fails() {
+        // 票 05：cc_isolation=true（默认）→ 清单缺 profile-state = Fail（setup 未跑）
+        let sys = FakeSys {
+            manifest: Ok(Some(vec![mentry("pasta", "/usr/bin/fake", Some("1.0.0"))])),
+            ..Default::default()
+        };
+        let p = profile("if:wg0");
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &sys,
+        );
+        let c = checks
+            .iter()
+            .find(|c| c.name == "manifest/cc-builtin")
+            .expect("manifest/cc-builtin 存在");
+        assert_eq!(c.status, Status::Fail, "{}", c.detail);
+        assert!(c.detail.contains("未登记"), "{}", c.detail);
+    }
+
+    #[test]
+    fn cc_builtin_registered_is_ok() {
+        let p = profile("if:wg0");
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &FakeSys::default(),
+        );
+        let c = checks
+            .iter()
+            .find(|c| c.name == "manifest/cc-builtin")
+            .expect("manifest/cc-builtin 存在");
+        assert_eq!(c.status, Status::Ok, "{}", c.detail);
+        assert!(c.detail.contains("×3"), "{}", c.detail);
+    }
+
+    #[test]
+    fn cc_isolation_false_axis_has_no_builtin_demand() {
+        // false 轴：不要求内置对登记（与宿主共享 = 声明语义）
+        let p: Profile =
+            toml::from_str("egress = 'if:wg0'\nagent.cc_isolation = false").unwrap();
+        let sys = FakeSys {
+            manifest: Ok(Some(vec![mentry("pasta", "/usr/bin/fake", Some("1.0.0"))])),
+            ..Default::default()
+        };
+        let checks = run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "x",
+            &p,
+            &sys,
+        );
+        let c = checks
+            .iter()
+            .find(|c| c.name == "manifest/cc-builtin")
+            .expect("manifest/cc-builtin 存在");
+        assert_eq!(c.status, Status::Ok, "{}", c.detail);
+        assert!(c.detail.contains("false"), "{}", c.detail);
+    }
+
+    #[test]
     fn manifest_missing_fails_with_setup_hint() {
         let sys = FakeSys {
             manifest: Ok(None),
@@ -1058,7 +1250,12 @@ mod tests {
     #[test]
     fn provider_version_drift_warns() {
         let sys = FakeSys {
-            manifest: Ok(Some(vec![mentry("pasta", "/usr/bin/fake", Some("0.0.9-drift"))])),
+            manifest: Ok(Some(
+                vec![mentry("pasta", "/usr/bin/fake", Some("0.0.9-drift"))]
+                    .into_iter()
+                    .chain(ps_entries("x"))
+                    .collect(),
+            )),
             ..Default::default()
         };
         let p = profile("if:wg0");
@@ -1271,6 +1468,7 @@ mod tests {
     #[test]
     fn socks_egress_healthy_is_all_ok() {
         let mut m = default_manifest();
+        m.extend(ps_entries("sg"));
         m.push(worker_entry());
         let sys = FakeSys {
             manifest: Ok(Some(m)),
@@ -1305,6 +1503,7 @@ mod tests {
     #[test]
     fn socks_egress_geo_mismatch_fails_and_unreachable_geo_warns() {
         let mut m = default_manifest();
+        m.extend(ps_entries("sg"));
         m.push(worker_entry());
         let toml = "egress = 'socks5://127.0.0.1:7891'\nlocale.tz = 'Asia/Tokyo'";
         let sys = FakeSys {
