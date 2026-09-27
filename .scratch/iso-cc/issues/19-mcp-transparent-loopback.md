@@ -2,7 +2,16 @@
 
 **What to build（探究后落地）:** 读取当前 claude code 的 MCP 配置，找指向 `127.0.0.1`/`localhost` 的 HTTP/SSE MCP 条目，在 netns 内自动建端口映射，使 cc 对 `127.0.0.1:<port>` 的连接透明到达宿主服务——cc 配置零改动（用户提案 2026-09-27）。
 
-**Blocked by:** 无（探究不依赖 05/18；落地排期后定）　**Owner:** 未定
+**Blocked by:** 无　**Owner:** lane-mcp-loop-probe（探究完成）
+**Status:** 探究 done（2026-09-27，REPORT 174 行，parent 抽验锚点属实）
+
+## Answer（PM 落）
+
+- **结论：可行，且比提案更省——passt 2026_07_16 默认已原生镜像**：attach 时刻宿主全部 TCP 监听端口自动镜像为 netns 内 `[::]:PORT` 双栈监听，cc 拨 `127.0.0.1:<同端口>` **零组件**透明到达宿主（loopback-only 的 mihomo 7891 也通，204×4 实测）。原型 NATIVE-MIRROR-ROUNDTRIP OK
+- 机制择型：**c) pasta 原生 ≫ a) socat per-port（作缺口兜底）＞ b) nft DNAT**（三开关缺一即超时黑洞，难诊——F1/F2 对照实测）
+- **关键边界（落地票输入）**：镜像集 = attach 时刻快照（attach 后启动的服务不补，实测 20s）→ 缺口补丁 = socat per-port（已证可用）；治理 flag 是 `-T/-U` 非 `-t/-u`，且显式 `-T SPEC` 会关闭全部 loopback 捕获（外科手术式排除被证伪）；冲突处置 = 会话服务避让 + Warn（EADDRINUSE 多次实测）；生命周期 = session-scoped 无需 manifest（b 规则随 netns 消亡已证；a 孤儿转发进程会拽住 netns 需先收割）
+- mark 引擎无关（无 netns 天然直达）；本机文件态 http/sse loopback MCP = 0 条（脱敏清单在 REPORT §1；真实环境才有数据）
+- 落地票（20）：探针 + 缺口 socat 编排 + 解析器，估 2 人日，REPORT §8 有文件集；**扫描源必须是 profile 的 claude.json（ADR 0006 重定向后）**
 
 ## 提案原文（用户）
 
