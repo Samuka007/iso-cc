@@ -96,3 +96,14 @@ rootless 轻量会话：userns+mountns+netns + 用户态网关（pasta）钉死�
 机制正本 = ADR 0008 附/附2/附3（exec.sock RPC、拦截分层 L1/L1.5/L2/L3/L4、multi-call shim、cc 2.1.263 工具面取证：hooks/REPL/statusline 硬编码 /bin/sh，L1.5=CLAUDE_CODE_SHELL_PREFIX 优先验证）。
 
 **Acceptance**：config 出现两独立声明面；`--print-plan` 展开组合；票 15 落地后自证探针（会话内 exec 标记二进制 → 断言落点宿主侧/沙箱侧与声明一致）。
+
+### 2026-09-27（五）：引擎重审——路由表方案从"已拒绝"升回候选（触发条件已实际触发）
+
+**Requirement**：用户连续质疑（--publish 为何存在 / 为何不是路由表方案 / 不是不要 netns 吗）= D2 预设的 mark 引擎触发条件（netns localhost 摩擦）实际触发。且变更（一）的两级模型移除了当初拒绝 B 方案的全部实质理由（root → setup 许可；持久规则 → 清单+gc+doctor 可管理）。
+
+**Specification**：引擎改为双候选并存、按 config `engine` 声明——
+1. `engine = "netns"`（已实现）：pasta spawn + tun2socks 组合；强项 = R8 结构性 fail-closed（pidns 整树杀）、端口空间隔离、v6 语义；弱项 = localhost 需桥接（17 的 auto 转发）
+2. `engine = "mark"`（待实验，原 D2 降格方案的 uid 路由变体）：setup 一次性安装 uidrange/ip-rule 策略路由 + 表内黑洞兜底（fail-closed）+ 专用 uid；会话零 netns，**localhost 双向零摩擦**；socks 隧道形态下 mihomo 直接 TUN 化，省 tun2proxy；强项 = US8/US9 结构性成立；弱项 = 原语持久面（清单+doctor+gc 管理）、端口空间与宿主共享
+3. 裁决依据 = 票 18 实验（mark 引擎全链本机实证：setup 装规则 → 无 netns 会话 localhost 双向 + 出口走 mihomo TUN → fail-closed 断网取证 → gc 回收干净）
+
+**Acceptance**：两引擎各有可跑通的验收矩阵；`--print-plan`/doctor/verify 引擎无关（R12 前置）；用户按环境择引擎。
