@@ -30,16 +30,23 @@ pub fn is_stub_invocation(argv0: Option<&OsStr>) -> bool {
     }
 }
 
-/// 从 argv（已去 argv0）解析转发脚本。见模块注释的三形态；无法识别 = Err（126）。
+/// 从 argv（已去 argv0）解析转发脚本。见模块注释的三形态；`-c` 后容 flag 段
+///（票 25 G1a，现知 `-l`）；无法识别 = Err（126）。
 pub fn parse_script(args: &[OsString]) -> Result<OsString, String> {
-    // L1/L2 形态：取最后一个 `-c`（容忍 `-l -c` 一类 flag 前置），其后恰一个参数。
+    // L1/L2 形态：取最后一个 `-c`（容忍 `-l -c` 一类 flag 前置）。
     if let Some(i) = args.iter().rposition(|a| a == "-c") {
-        if args.len() == i + 2 {
-            return Ok(args[i + 1].clone());
+        // 票 25 G1a：cc 2.1.263 Bash 工具/hooks/statusline 的 `getSpawnArgs` 在
+        // snapshot 缺席时产出 `["-c", "-l", script]`（snapshot 探测经 `$SHELL` =
+        // shim，host 轴恒失败 → 实际恒见 `-l`）。容忍 flag 段，script = 段后
+        // 唯一剩余参数；多脚本参数仍 fail-loud（126）。
+        let rest = &args[i + 1..];
+        let flags = rest.iter().take_while(|a| is_post_c_flag(a)).count();
+        if rest.len() == flags + 1 {
+            return Ok(rest[flags].clone());
         }
         return Err(format!(
-            "`-c` 后参数数异常（{}）：仅接受单段脚本",
-            args.len() - i - 1
+            "`-c` 后参数数异常（{}）：仅接受 flag 段 + 单段脚本",
+            rest.len() - flags
         ));
     }
     // L1.5 形态：单载荷 = cc 组装的完整调用串（整体转宿主执行，含其内嵌 bash -c）。
@@ -50,6 +57,14 @@ pub fn parse_script(args: &[OsString]) -> Result<OsString, String> {
         "无法识别的调用形态（{} 个参数）：期望 `bash -c <script>` 或 prefix 单载荷",
         args.len()
     ))
+}
+
+/// `-c` 与脚本之间容忍的 flag 段（票 25 G1a）。现知仅 `-l`（login shell）；
+/// 未知 flag 不在册 = 落入脚本位 → 段后参数数检查 fail-loud。
+const POST_C_FLAGS: [&str; 1] = ["-l"];
+
+fn is_post_c_flag(a: &OsString) -> bool {
+    POST_C_FLAGS.iter().any(|f| OsStr::new(*f) == a.as_os_str())
 }
 
 /// 转发模式主体：不返回（exit）。
@@ -137,6 +152,29 @@ mod tests {
         assert!(
             parse_script(&os(&["-c", "a", "b"])).is_err(),
             "-c 后多参 = Err"
+        );
+    }
+
+    #[test]
+    fn parse_post_c_flag_segment_tolerated() {
+        // 票 25 G1a：cc 2.1.263 Bash 工具真实形态回放（getSpawnArgs snapshot
+        // 缺席 → `["-c", "-l", script]`）；E5 实锤形态，修复前按参数数=2 拒收 126。
+        let payload = "echo probe-$((6*7))";
+        assert_eq!(
+            parse_script(&os(&["-c", "-l", payload])).unwrap(),
+            payload,
+            "cc 2.1.263 真实形态：-c -l <script>"
+        );
+        assert_eq!(
+            parse_script(&os(&["-c", payload])).unwrap(),
+            payload,
+            "无 snapshot 形态：-c <script>"
+        );
+        // flag 段可多枚；段后多脚本参数仍 fail-loud
+        assert_eq!(parse_script(&os(&["-c", "-l", "-l", payload])).unwrap(), payload);
+        assert!(
+            parse_script(&os(&["-c", "-l", "a", "b"])).is_err(),
+            "flag 段后多脚本参数 = Err（fail-loud 保持）"
         );
     }
 

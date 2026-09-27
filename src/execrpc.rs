@@ -114,8 +114,12 @@ pub(crate) fn send_request(s: &UnixStream, req: &ExecRequest, fds: &[RawFd]) -> 
 
 /// 宿主 worker env 注入项（纯函数，可单测）。镜像 session::apply_env 的 locale/显式 env
 /// 语义（ADR 附：「env = 宿主原 PATH + 注入 locale 项」——基底 env 由 server 进程自带，
-/// 此处只给注入项）+ 会话标记（spec#4）。
-pub(crate) fn worker_env_vars(profile: &Profile, session_id: &str) -> BTreeMap<String, String> {
+/// 此处只给注入项）+ 会话标记（spec#4）+ 通道指针（票 25 G1b）。
+pub(crate) fn worker_env_vars(
+    profile: &Profile,
+    session_id: &str,
+    sock_path: &Path,
+) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
     if let Some(tz) = &profile.locale.tz {
         m.insert("TZ".into(), tz.clone());
@@ -130,6 +134,14 @@ pub(crate) fn worker_env_vars(profile: &Profile, session_id: &str) -> BTreeMap<S
     // 会话标记：宿主侧派生进程入 13 收割面（marked → teardown SIGKILL + reap；
     // 后台任务存续至会话结束，票 15 spec#4）。
     m.insert("ISO_CC_SESSION".into(), session_id.to_string());
+    // 通道指针（票 25 G1b）：Bash 工具/hooks/statusline 的载荷 = Yhe 产物
+    // `'<shim>' '<script>'`，宿主 worker bash 执行它时第二跳再进 shim（L1.5
+    // 单载荷形态）——第二跳 stub 依赖继承的 ISO_CC_EXEC_SOCK 经同一通道转发，
+    // 一次额外 RPC 跳，终态语义不变（脚本仍由宿主 `/bin/bash -c` 执行）。
+    m.insert(
+        "ISO_CC_EXEC_SOCK".into(),
+        sock_path.to_string_lossy().into_owned(),
+    );
     m
 }
 
@@ -206,7 +218,7 @@ pub fn prepare(
     let sock_mode = if cross_uid { 0o666 } else { 0o600 };
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(sock_mode))
         .with_context(|| format!("chmod {sock_mode:o} {}", sock_path.display()))?;
-    let vars = Arc::new(worker_env_vars(profile, session_id));
+    let vars = Arc::new(worker_env_vars(profile, session_id, &sock_path));
     Ok(ExecChannel {
         shell_path,
         bin_dir,
@@ -550,7 +562,8 @@ mod tests {
         let p = prof(
             "egress='if:wg0'\nlocale.tz='Asia/Singapore'\nlocale.lang='en_SG.UTF-8'\nenv.HISTFILE='/tmp/h'",
         );
-        let vars = worker_env_vars(&p, "sg-1");
+        let sock = Path::new("/s/t/exec.sock");
+        let vars = worker_env_vars(&p, "sg-1", sock);
         assert_eq!(vars.get("TZ").unwrap(), "Asia/Singapore");
         assert_eq!(vars.get("LANG").unwrap(), "en_SG.UTF-8");
         assert_eq!(vars.get("LC_ALL").unwrap(), "en_SG.UTF-8");
@@ -560,13 +573,21 @@ mod tests {
             "sg-1",
             "spec#4 会话标记"
         );
-        assert_eq!(vars.len(), 5);
+        assert_eq!(
+            vars.get("ISO_CC_EXEC_SOCK").unwrap(),
+            "/s/t/exec.sock",
+            "票 25 G1b 通道指针：第二跳 shim 经同一通道转发"
+        );
+        assert_eq!(vars.len(), 6);
         // 无 locale 声明 = 仅会话标记
         let p2 = prof("egress='if:wg0'");
-        let vars2 = worker_env_vars(&p2, "x-2");
+        let vars2 = worker_env_vars(&p2, "x-2", sock);
         assert_eq!(
             vars2,
-            BTreeMap::from([("ISO_CC_SESSION".into(), "x-2".into())])
+            BTreeMap::from([
+                ("ISO_CC_EXEC_SOCK".into(), "/s/t/exec.sock".into()),
+                ("ISO_CC_SESSION".into(), "x-2".into())
+            ])
         );
     }
 

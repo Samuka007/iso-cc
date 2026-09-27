@@ -1040,7 +1040,7 @@ impl Session {
             let mut reaped = false;
             for pid in list::children_of(self_pid) {
                 match list::proc_marker(pid) {
-                    Some(id) => {
+                    Ok(Some(id)) => {
                         // 原语 = ns.rs 安全薄封装；pid = reparent 到本进程的收养子女
                         // （subreaper 语义，waitpid 合法）。已死未收尸者 kill 得 ESRCH、
                         // waitpid 直接收尸；存活者 SIGKILL 不可捕获，阻塞收尸。
@@ -1051,9 +1051,19 @@ impl Session {
                         );
                         reaped = true;
                     }
-                    None => {
+                    // 票 25 G3：真缺失（environ 可读、确无标记）——域外孤儿，
+                    // 不杀语义不变。
+                    Ok(None) => {
                         eprintln!(
                             "[iso-cc] L2 登记: 收养孤儿 pid={pid} 无 ISO_CC_SESSION 标记——不杀；宿主侧 exec worker（票 15）带标记走 marked 支，本支仅域外孤儿"
+                        );
+                    }
+                    Err(e) => {
+                        // 票 25 G3：读失败（ESRCH/ENOENT）= 退出/僵尸窗口 race，
+                        // 非标记缺失（E1' 实锤：标记在册，扫描落窗口即误记）。
+                        // 已亡者无可杀，分记留档。
+                        eprintln!(
+                            "[iso-cc] L2 登记: 收养孤儿 pid={pid} environ 读失败（{e}）——退出/僵尸窗口 race，非标记缺失；不杀"
                         );
                     }
                 }

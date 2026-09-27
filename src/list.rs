@@ -12,6 +12,7 @@
 
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::io;
 
 /// 环境标记键（list.rs 原 :11 注释错位修正：env 键只覆盖 cc 树与 slirp 网关；
 /// pasta 本体 environ EACCES，不可用此键——见模块文档）。
@@ -175,9 +176,13 @@ pub fn children_of(ppid: u32) -> Vec<u32> {
         .collect()
 }
 
-/// 单进程标记读取（L2 收编的双键之「标记」键）。
-pub fn proc_marker(pid: u32) -> Option<String> {
-    read_environ_marker(pid)
+/// 单进程标记读取（L2 收编的双键之「标记」键）。三分语义（票 25 G3）：
+/// `Ok(Some)` = 标记在册；`Ok(None)` = environ 可读且确无标记；`Err` = 读失败
+///（ESRCH/ENOENT——进程退出/僵尸窗口，票 24 E1' 实锤的「无标记」误记来源）。
+/// 调用方必须分记 `Err` 与 `Ok(None)`，不得把 race 折算成「无标记」。
+pub fn proc_marker(pid: u32) -> io::Result<Option<String>> {
+    let env = std::fs::read(format!("/proc/{pid}/environ"))?;
+    Ok(marker_from_environ(&env))
 }
 
 fn scan_procs() -> Vec<ProcFacts> {
@@ -205,7 +210,10 @@ fn proc_pids() -> Vec<u32> {
 }
 
 fn read_environ_marker(pid: u32) -> Option<String> {
-    let env = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    marker_from_environ(&std::fs::read(format!("/proc/{pid}/environ")).ok()?)
+}
+
+fn marker_from_environ(env: &[u8]) -> Option<String> {
     env.split(|b| *b == 0)
         .filter(|kv| !kv.is_empty())
         .find_map(|kv| kv.strip_prefix(MARKER))
@@ -284,6 +292,32 @@ mod tests {
             cmdline: cmdline(args),
             netns,
         }
+    }
+
+    #[test]
+    fn proc_marker_tri_state_splits_race_from_true_absence() {
+        // 票 25 G3：E1' 实锤 race 伪象（标记在册，扫描落退出/僵尸窗口 → environ
+        // 读失败被记成「无标记」）。三分契约：活进程 = Ok（带不带标记随环境）；
+        // 摘除标记的活子进程 = Ok(None)（真缺失）；已亡 pid = Err（race 分支）。
+        assert!(
+            proc_marker(std::process::id()).is_ok(),
+            "活进程自身 environ 必可读"
+        );
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .env_remove("ISO_CC_SESSION")
+            .spawn()
+            .expect("spawn sleep");
+        let absent = proc_marker(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(absent.unwrap(), None, "可读但无标记 = Ok(None)，非 Err");
+        let gone = proc_marker(u32::MAX - 1).unwrap_err();
+        assert_eq!(
+            gone.kind(),
+            io::ErrorKind::NotFound,
+            "读失败 = Err（race 分支），不得折成 None"
+        );
     }
 
     #[test]

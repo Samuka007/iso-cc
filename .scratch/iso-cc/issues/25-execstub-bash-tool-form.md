@@ -2,7 +2,14 @@
 
 **What to build:** 修 G1（阻断级）：exec.bash=host 下 cc Bash 工具面 Exit 126——两层失配。依据 = /tmp/iso-cc-exp24/REPORT.md §G1 + E5 复现。
 
-**Blocked by:** 无（24 已完成取证）　**Owner:** 待派
+**Blocked by:** 无（24 已完成取证）　**Owner:** lane-execstub-fix（完成）
+**Status:** done（2026-09-27，parent 亲验通过）
+
+## Answer（PM 落）
+
+- 四锚全绿 + parent 复跑：nextest 143/143（+3：parse_post_c_flag_segment_tolerated / proc_marker_tri_state_splits_race_from_true_absence / worker_env 断言）；clippy 干净
+- E5 转绿亲验（e5.stream.json：probe-42、is_error:false）；hooks 同管线同绿（hook-proof.txt：sock=set = G1b 注入 live 实证）；G3 三分判据 live 分记（EADDRINUSE/environ 读失败 race 不再误记「无标记」）；E1 MCP 单载荷契约回归锚保留且绿
+- 触碰文件：execstub.rs / execrpc.rs / list.rs / session.rs
 
 ## Specification（REPORT 修复方向原样）
 
