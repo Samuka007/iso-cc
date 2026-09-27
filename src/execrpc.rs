@@ -32,8 +32,17 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use nix::sys::socket::{recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags, UnixAddr};
-/// 宿主侧执行体（票 15 spec#1 正本措辞：`/bin/bash -c`）。
+/// 宿主侧执行体默认值（票 15 spec#1 正本措辞：`/bin/bash -c`）。
 const HOST_SHELL: &str = "/bin/bash";
+
+/// 宿主侧执行体解析（票 21 测试支撑面）：env `ISO_CC_HOST_SHELL` 注入时覆盖，
+/// 未设 = 正本 [`HOST_SHELL`]，运行时语义零变化。nix 沙箱无 FHS `/bin/bash`
+/// 路径，测试（[`tests::test_host_shell`]）据此注入沙箱内实际可用的 bash/sh。
+fn host_shell() -> PathBuf {
+    std::env::var_os("ISO_CC_HOST_SHELL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(HOST_SHELL))
+}
 
 /// 帧上限：脚本为 cc Bash 工具的整段 argv（ADR 附「拦截粒度 = bash -c 整段 argv」），
 /// 2 MiB 覆盖全部合理负载；超界 = 协议错误（fail-loud）。
@@ -272,7 +281,8 @@ impl ExecServer {
     }
 }
 
-/// 单连接处理：收 fd + 请求 → 宿主侧 fork `/bin/bash -c`（dup2 接管 stdio）→
+/// 单连接处理：收 fd + 请求 → 宿主侧 fork 宿主 shell `-c`（正本 `/bin/bash`，
+/// 票 21 测试支撑面 env `ISO_CC_HOST_SHELL` 可覆盖；dup2 接管 stdio）→
 /// waiter（wait + 回传状态）+ watcher（EOF/中断 → SIGKILL）双线程。
 fn handle_conn(mut stream: UnixStream, spec: Arc<WorkerSpec>, registry: Arc<Mutex<Vec<u32>>>) {
     // accept 期凭证白名单（票 18）：0666 文件位下任何本地用户可 connect，
@@ -300,7 +310,8 @@ fn handle_conn(mut stream: UnixStream, spec: Arc<WorkerSpec>, registry: Arc<Mute
         return;
     }
 
-    let mut cmd = std::process::Command::new(HOST_SHELL);
+    let shell = host_shell();
+    let mut cmd = std::process::Command::new(&shell);
     cmd.arg("-c")
         .arg(&req.script)
         .current_dir(&req.cwd)
@@ -318,7 +329,7 @@ fn handle_conn(mut stream: UnixStream, spec: Arc<WorkerSpec>, registry: Arc<Mute
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let msg = format!("宿主侧 spawn {HOST_SHELL} 失败: {e}");
+            let msg = format!("宿主侧 spawn {} 失败: {e}", shell.display());
             eprintln!("[iso-cc] exec-rpc: {msg}");
             let _ = write_frame(&mut stream, &ExecResponse::Error { error: msg });
             return;
@@ -458,6 +469,36 @@ fn take_from_registry(reg: &Mutex<Vec<u32>>, pid: u32) -> bool {
 mod tests {
     use super::*;
 
+    /// 票 21：nix 沙箱无 FHS `/bin/bash`——宿主 shell 解析序：
+    /// ① env `ISO_CC_HOST_SHELL` 显式注入（CI/nix 构建面定向）；
+    /// ② 正本 `/bin/bash`（宿主常态）；
+    /// ③ PATH 探测 `bash` → `sh`（沙箱内 = nix store bash）。
+    /// 全部落空 = None → 调用方按 fail-loud 语义跳过（eprintln 注明原因，
+    /// 非静默通过）。
+    fn test_host_shell() -> Option<PathBuf> {
+        let mut cands: Vec<PathBuf> = Vec::new();
+        if let Some(p) = std::env::var_os("ISO_CC_HOST_SHELL") {
+            cands.push(PathBuf::from(p));
+        }
+        cands.push(PathBuf::from(HOST_SHELL));
+        cands.push(PathBuf::from("bash"));
+        cands.push(PathBuf::from("sh"));
+        cands.into_iter().find(|cand| {
+            std::process::Command::new(cand)
+                .arg("-c")
+                .arg("true")
+                .status()
+                .is_ok_and(|st| st.success())
+        })
+    }
+
+    /// 把解析到的 shell 经 env 注入 exec-rpc 宿主执行面（[`host_shell`]）。
+    /// nextest 每测试独立进程，set_var 无跨测试竞争；cargo test 多线程下两处
+    /// 注入值恒相同，最坏回落正本 `/bin/bash`（宿主常态），断言不受影响。
+    fn inject_host_shell(shell: &Path) {
+        std::env::set_var("ISO_CC_HOST_SHELL", shell);
+    }
+
     fn prof(toml_str: &str) -> Profile {
         toml::from_str(toml_str).unwrap()
     }
@@ -533,6 +574,14 @@ mod tests {
     /// 链路）→ 宿主 worker stdout 直通 + cwd/env 注入 + 退出码回传。
     #[test]
     fn channel_roundtrip_stdio_env_and_exit_code() {
+        // 票 21：宿主 shell 参数化（沙箱内 = nix store bash；全缺 = fail-loud 跳过）。
+        let Some(shell) = test_host_shell() else {
+            eprintln!(
+                "[skip] 票 21: 无可用宿主 shell（/bin/bash 与 PATH bash/sh 均不可探活）——跳过"
+            );
+            return;
+        };
+        inject_host_shell(&shell);
         let dir = tempfile::tempdir().unwrap();
         let p = prof("egress='if:wg0'\nlocale.tz='Asia/Singapore'");
         let ch = prepare(dir.path(), &p, "t-chan", false).expect("prepare");
@@ -596,6 +645,14 @@ mod tests {
     /// 中断转发（spec#1）：对端断开 → 在途 worker 被 SIGKILL（sleep 不遗留为 residue）。
     #[test]
     fn peer_eof_interrupts_worker() {
+        // 票 21：宿主 shell 参数化（worker 未 spawn = 未登记，见 channel 测试注释）。
+        let Some(shell) = test_host_shell() else {
+            eprintln!(
+                "[skip] 票 21: 无可用宿主 shell（/bin/bash 与 PATH bash/sh 均不可探活）——跳过"
+            );
+            return;
+        };
+        inject_host_shell(&shell);
         let dir = tempfile::tempdir().unwrap();
         let p = prof("egress='if:wg0'");
         let ch = prepare(dir.path(), &p, "t-intr", false).expect("prepare");
@@ -666,9 +723,20 @@ mod tests {
         }
         {
             let dir = tempfile::tempdir().unwrap();
-            let ch = prepare(dir.path(), &p, "t-mode-mark", true).expect("prepare mark");
-            let md = std::fs::metadata(&ch.sock_path).unwrap();
-            assert_eq!(md.permissions().mode() & 0o777, 0o666);
+            // 票 21：mark 分支经 mark::ensure_shim_binary 写 /var/tmp/iso-cc-mark/bin
+            //（uid 4210 资产根）——nix 沙箱该路径不可写 → fail-loud 跳过本分支；
+            // socket-mode 断言语义由上方 netns 分支同构覆盖，mark 分支宿主面照常执行。
+            let mark_bin = crate::mark::state_root().join("bin");
+            if std::fs::create_dir_all(&mark_bin).is_ok() {
+                let ch = prepare(dir.path(), &p, "t-mode-mark", true).expect("prepare mark");
+                let md = std::fs::metadata(&ch.sock_path).unwrap();
+                assert_eq!(md.permissions().mode() & 0o777, 0o666);
+            } else {
+                eprintln!(
+                    "[skip] 票 21: mark 根 {} 不可写（nix 沙箱）——跳过 mark 分支 socket-mode 断言",
+                    mark_bin.display()
+                );
+            }
         }
     }
 }

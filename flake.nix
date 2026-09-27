@@ -25,7 +25,14 @@
         };
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchainFor;
 
-        src = craneLib.cleanCargoSource ./.;
+        # cleanCargoSource 只保留 cargo 面（.rs/TOML/Lock）——18B 的 include_str!
+        # 依赖 src/mark-uidrun.c（file-cap 助手源），必须显式放行，否则 nix 构建
+        # 在编译期 No such file（本地 cargo 构建不暴露该缺口）。
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            (pkgs.lib.hasSuffix "\.c" path) || (craneLib.filterCargoSources path type);
+        };
 
         commonArgs = {
           inherit src;
