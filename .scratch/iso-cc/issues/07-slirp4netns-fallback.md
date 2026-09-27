@@ -6,5 +6,5 @@
 
 **Status:** ready-for-agent
 
-- [ ] 4090（universe slirp4netns 1.0.1）过 T5 全矩阵
+- [ ] 跨发行版全矩阵（4090 等）——降级为待办：出口形态未定前只验传输语义（本机已绿），不验地理身份
 - [ ] provider 切换仅改 config，不改调用方

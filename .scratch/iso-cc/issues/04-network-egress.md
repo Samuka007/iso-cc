@@ -4,7 +4,7 @@
 
 **Blocked by:** 03
 
-**Status:** in-progress（slirp4netns 传输本机绿；4090 egress 语义待验）
+**Status:** done（传输面由 09/12 吸收）；**egress 目标形态待定**：2026-09-27 用户裁决——4090 的 wg0 假设作废（用户确认不知其来源，不作真出口）。出口 = 用户未来提供的真实隧道接口 或 D4 SOCKS 择型（pasta+tun2proxy vs embedded）；本机验证一律 if:eth0（宿主物理出口）只证传输语义，不声称地理身份。
 
 > **2026-09-26 实施重排**：发现 slirp 硬编码违反 ADR 0007（pasta 才是 primary）且 egress 接口纯装饰（fail-open）。实施拆入 **09**（provider 化 + fail-loud，A1 无阻塞）与 **10**（本机 pasta attach TUNSETIFF 调查，阻塞 09/A2）。本票 4090 验收沿用 09/A2 结论。
 
