@@ -42,7 +42,7 @@
 | 21 ppa-publishing | in-flight（binary-repack 源码包路线：deb 树+组装脚本+lintian 阶梯；上传需用户 GPG/Launchpad 凭据） | — |
 
 | 21 execrpc-nix-sandbox-test | done（2026-09-27：host_shell 解析器 + 沙箱守卫，nix build 全绿亲验） | — |
-| 22 remove-mcp-fallback | ready（21 完成后可开工） | 21✅ |
+| 22 remove-mcp-fallback | done（2026-09-27 亲验：兜底删除、P-MCP 两态化、BREAKING 进 CHANGELOG） | — |
 | 23 playwright-driver-exploration | 探究待派（已按用户收窄：仅『会话内 Playwright 驱动宿主已登录 Chrome』用例，1235 删） | — |
 
 ## 邻位协作（herdr 双 agent，w12 workspace）——协议已接受并执行
@@ -59,9 +59,12 @@
 
 | 24 L15-stdio-MCP-grounding | ready（L1.5×stdio MCP 常驻链从未实测；@playwright/mcp 真负载逐跳 grounding） | — |
 
-## 收尾态（2026-09-27）
+## 收尾态（2026-09-27，二次收口）
 
-Agent 侧可做工作已全部完成（01-05、08-20 done）。剩余需外部输入：
+**全部实现票完成**（01-05、08-25 done；探针 141+2、双引擎、三形态出口）。剩余需外部输入：
+- **06 重估**：本机已有真 claude -p（票 24/E1 实证）——探针矩阵可部分推进，不再完全阻塞
+- 邻居 R2 registry：等操作者凭据四件套（R2 token/GPG/域名/secrets）
+- 裁决项：默认引擎、minisign 签名、nixpkgs 上游 PR、mihomo 持久化
 - **06**：真实 cc 探针扩充（R12 子矩阵、P16-P27 工具面）——需真实 cc 环境/账号
 - **真机验证项**：真实 cc 登录凭据落点、/status 视线（票 05）、L3/L4 拦截层（票 15 边界）
 - **07 残余**：跨发行版传输语义（降级待办，等真实多环境）
