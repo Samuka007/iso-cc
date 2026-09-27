@@ -18,7 +18,8 @@
 
 | 19 mcp-transparent-loopback | 探究 done（2026-09-27：pasta 原生镜像 = 零组件透明；择型 c≫a>b；快照边界入档） | — |
 | 20 mcp-loopback-landing | ready（薄落地：P-MCP 探针 + 快照缺口 socat 兜底 + 冲突 Warn；估 2 人日内） | — |
-| 18B mark-engine-impl | in-flight（MarkEngineImpl lane） | 05✅ |
+| 18B mark-engine-impl | done（2026-09-27，parent 亲验：mark 全链 + 集成 bug 修复 + 128 测试） | — |
+| 20 mcp-loopback-landing | in-flight（McpLoopLand lane） | — |
 
 > **egress 目标形态（2026-09-27 用户裁决）**：4090 wg0 假设作废。出口 = 用户提供的真实隧道接口 或 D4 SOCKS 择型；地理身份探针（P13）在无隧道机器上恒按实红，不阻塞任何票。
 
@@ -28,7 +29,7 @@
 | 05 cc-profile-isolation | ready | 下一主力票（R4/R5：redirect 集与 CC 状态重定向实测） |
 | 06 verify-matrix | in-progress | v0.2 子集绿（8 探针）；R12 子矩阵与 P16–P27 工具面待真实 cc 环境 |
 | 07 slirp4netns-fallback | done（吸收进 09 selfmap 入口） | 4090 全矩阵待跑 |
-| 08 release | ready | 全票合口后 |
+| 08 release-packaging | in-flight（PackageRelease lane：nfpm deb/rpm/apk + bundle tar + 版本注入 + release workflow；podman 模式蓝本） | — |
 | 16 socks-form-tun2socks | done（2026-09-27 亲验） | D4 裁决=组合成立零自研；首个全绿 verify（P13 geo=SG）；embedded 降级远期 |
 | engine=mark 变体 | pending（触发条件未触发） | exec.bash=host 已解 US9 主诉求；cc 直spawn 进程的透明 localhost 残余缺口观察中 |
 

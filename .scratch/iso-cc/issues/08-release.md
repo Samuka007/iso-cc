@@ -1,10 +1,33 @@
-# 08 — 发布（musl 静态产物 + 文档）
+# 08 — 版本化与多发行版打包分发（registry 除外）
 
-**What to build:** `nix build` 产出 musl 静态二进制；安装/使用文档（含隧道侧出 TUN 边界、localhost 语义分层、hostgw 别名指南）；cargo-deny 门禁（对齐 oh-my-pi deny.toml）；GitHub Release。
+**What to build:** 自动化版本化 + 多发行版软件包。设计蓝本 = podman 模式（会话研究结论）：**核心单二进制 + 外部 helper 二进制按发行版生态协调**。
 
-**Blocked by:** 06, 07
+**Blocked by:** 无（与 20 lane 文件集零交叉，可并行）　**Owner:** 待派
 
-**Status:** ready-for-agent
+## 设计（来源：podman/passt 集成研究 + 本仓架构）
 
-- [ ] 两台宿主从二进制冷启动过 T5
-- [ ] cargo-deny（licenses/advisories/bans）绿
+1. **版本化单一事实源**：git tag（`v*`）为准；`build.rs` 注入 `git describe --tags --dirty` → `iso-cc --version` 显示完整版本；Cargo.toml 版本随 tag 同步（脚本校验一致性，不一致 fail-loud）
+2. **构建**：flake 已有 `x86_64-unknown-linux-musl` target → 静态单文件（D5：跨发行版单文件），CI nix 环境构建
+3. **两分发形态**（照搬 podman：依赖下放发行版 or 捆绑）：
+   - **发行版原生包**：`Depends: passt, slirp4netns`（版本下限）；`Recommends: tun2proxy`（socks 形态增强）。工具 = **nfpm**（单 YAML → deb/rpm/apk/arch；nixpkgs#nfpm）
+   - **bundle 模式**（tar.gz）：iso-cc 静态二进制 + 上游静态 `pasta`/`slirp4netns`/`tun2proxy` 置于 `libexec/` 相对目录——解决 jammy 无 passt 等缺口（ADR 0007 既有预案）；票 14 manifest 钉路径已支持 libexec 定位，无需新机制
+   - 路径解析优先级（对标 CONTAINERS_HELPER_BINARY_DIR）：manifest 钉路径 > `ISO_CC_HELPER_DIR` env > PATH（14 已实现前两者，补 env 缺口）
+4. **CI/CD**：tag push → workflow：test → musl build → nfpm（deb/rpm/apk）→ PKGBUILD lint → sha256sum → GitHub Release 上传（签名 minisign 后置票）
+5. **明确不做**：crates.io/npm 等 registry；APT/Pacman 源托管（后续票，工具已调研：aptly/artifactx/debanator/repo-add）
+
+## Acceptance
+
+- [ ] `iso-cc --version` 输出 tag+commits+dirty；与 git tag 不一致的 Cargo.toml → 构建 fail-loud
+- [ ] nfpm 本地产出 deb+rpm+apk 三包；`dpkg-deb -c/-I` 抽验：二进制位、Depends 字段（passt slirp4netns 版本下限）、文件路径正确
+- [ ] bundle tar.gz：三 helper 静态二进制 + iso-cc；解包后 `ISO_CC_HELPER_DIR=libexec` 下 run -- true e2e rc=0（无 PATH 依赖）
+- [ ] PKGBUILD 模板（AUR 形态）lint 通过（namcap 或人工对照清单）
+- [ ] release workflow YAML 就位（tag 触发矩阵）；`act`/dry-run 或人工推演留档
+- [ ] clippy -D warnings 绿；nextest 全绿
+
+## 轮子盘点
+
+nfpm（单声明多格式，nixpkgs#nfpm）；nix-bundle-app/toDeb/toRpm（备选，QEMU debBuild 拒——重）；cargo-deb 拒（单 deb 格式）；上游静态 release（passt/slirp4netns 官方单文件，sha256 钉定）。
+
+## 边界
+
+- 不改 `.scratch/**`、`docs/**`；不 git；不动 20 lane 文件集（probe/session/config/plan/doctor）；一次验证收尾
