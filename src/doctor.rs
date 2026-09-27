@@ -72,6 +72,41 @@ pub trait SysInspect {
     /// 清单注入缝（票 14）：None = 清单缺失（setup 未跑）；Some = 条目集；
     /// Err = 损坏/schema 未知（fail-loud）。
     fn manifest_state(&self) -> Result<Option<Vec<crate::manifest::Entry>>, String>;
+
+    // ===== mark 引擎注入缝（票 18；default = 不可测，FakeSys 按需覆写）=====
+    /// `ip rule show` 输出（v4）。None = ip 不可用（对应检查 Fail：路由面不可测）。
+    fn ip_rule_show(&self) -> Option<String> {
+        None
+    }
+    /// `ip -6 rule show` 输出。
+    fn ip_rule_show6(&self) -> Option<String> {
+        None
+    }
+    /// `ip route show table <t>` 输出。None = ip 不可用。
+    fn ip_route_table(&self, table: u32) -> Option<String> {
+        let _ = table;
+        None
+    }
+    /// `getcap <path>` 输出（None = getcap 不可用/路径无 caps）。
+    fn file_caps(&self, path: &Path) -> Option<String> {
+        let _ = path;
+        None
+    }
+    /// 接口管理态 UP（sysfs IFF_UP；netns #3 同源）。
+    fn iface_up(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
+    /// uid 是否已被账户占用（NSS 感知；mark 的 DAC 隔离前提）。
+    fn uid_in_use(&self, uid: u32) -> bool {
+        let _ = uid;
+        false
+    }
+    /// 路径属主 uid（None = 不可 stat）。
+    fn path_owner_uid(&self, path: &Path) -> Option<u32> {
+        let _ = path;
+        None
+    }
 }
 
 pub struct RealSys;
@@ -158,6 +193,41 @@ impl SysInspect for RealSys {
             Err(e) => Err(e.to_string()),
         }
     }
+    fn ip_rule_show(&self) -> Option<String> {
+        ip_out(&["rule", "show"])
+    }
+    fn ip_rule_show6(&self) -> Option<String> {
+        ip_out(&["-6", "rule", "show"])
+    }
+    fn ip_route_table(&self, table: u32) -> Option<String> {
+        ip_out(&["route", "show", "table", &table.to_string()])
+    }
+    fn file_caps(&self, path: &Path) -> Option<String> {
+        let out = std::process::Command::new("getcap")
+            .arg(path)
+            .output()
+            .ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+    fn iface_up(&self, name: &str) -> bool {
+        crate::provider::host_iface_up(name).is_ok()
+    }
+    fn uid_in_use(&self, uid: u32) -> bool {
+        std::process::Command::new("getent")
+            .args(["passwd", &uid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    fn path_owner_uid(&self, path: &Path) -> Option<u32> {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(path).ok().map(|m| m.uid())
+    }
+}
+
+fn ip_out(args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("ip").args(args).output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// /proc/net/route 里属于某接口的目的地址（十六进制小端）。
@@ -181,45 +251,48 @@ pub fn run(
     sys: &dyn SysInspect,
 ) -> Vec<Check> {
     let mut out = Vec::new();
+    let mark = profile.engine() == crate::config::Engine::Mark;
 
-    // 1. userns 可用性（R5）
-    match sys.read_sysctl("/proc/sys/user/max_user_namespaces") {
-        Ok(v) if v.parse::<i64>().unwrap_or(0) > 0 => {
-            out.push(Check::new("userns/max_user_namespaces", Status::Ok, v));
+    // 1. userns 可用性（R5）——netns 引擎专属机制面；mark 引擎零 netns，跳过。
+    if !mark {
+        match sys.read_sysctl("/proc/sys/user/max_user_namespaces") {
+            Ok(v) if v.parse::<i64>().unwrap_or(0) > 0 => {
+                out.push(Check::new("userns/max_user_namespaces", Status::Ok, v));
+            }
+            Ok(v) => out.push(Check::new(
+                "userns/max_user_namespaces",
+                Status::Fail,
+                format!("{v}（必须 > 0）"),
+            )),
+            Err(e) => out.push(Check::new(
+                "userns/max_user_namespaces",
+                Status::Fail,
+                e.to_string(),
+            )),
         }
-        Ok(v) => out.push(Check::new(
-            "userns/max_user_namespaces",
-            Status::Fail,
-            format!("{v}（必须 > 0）"),
-        )),
-        Err(e) => out.push(Check::new(
-            "userns/max_user_namespaces",
-            Status::Fail,
-            e.to_string(),
-        )),
-    }
-    // Debian/Ubuntu 专属开关；不存在 = 主线内核默认允许
-    match sys.read_sysctl("/proc/sys/kernel/unprivileged_userns_clone") {
-        Ok(v) if v == "1" => out.push(Check::new("userns/unprivileged_clone", Status::Ok, "1")),
-        Ok(v) => out.push(Check::new(
-            "userns/unprivileged_clone",
-            Status::Fail,
-            format!("{v}（必须 = 1）"),
-        )),
-        Err(_) => out.push(Check::new(
-            "userns/unprivileged_clone",
-            Status::Ok,
-            "无此 sysctl（主线内核，默认允许）",
-        )),
-    }
-    // Ubuntu 23.10+/24.04 AppArmor 限制（P3 后置；fail-loud 提示）
-    if let Ok(v) = sys.read_sysctl("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") {
-        if v == "1" {
-            out.push(Check::new(
-                "userns/apparmor",
-                Status::Warn,
-                "已启用限制：rootless userns 将被拒；需安装 iso-cc apparmor profile（P3）",
-            ));
+        // Debian/Ubuntu 专属开关；不存在 = 主线内核默认允许
+        match sys.read_sysctl("/proc/sys/kernel/unprivileged_userns_clone") {
+            Ok(v) if v == "1" => out.push(Check::new("userns/unprivileged_clone", Status::Ok, "1")),
+            Ok(v) => out.push(Check::new(
+                "userns/unprivileged_clone",
+                Status::Fail,
+                format!("{v}（必须 = 1）"),
+            )),
+            Err(_) => out.push(Check::new(
+                "userns/unprivileged_clone",
+                Status::Ok,
+                "无此 sysctl（主线内核，默认允许）",
+            )),
+        }
+        // Ubuntu 23.10+/24.04 AppArmor 限制（P3 后置；fail-loud 提示）
+        if let Ok(v) = sys.read_sysctl("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") {
+            if v == "1" {
+                out.push(Check::new(
+                    "userns/apparmor",
+                    Status::Warn,
+                    "已启用限制：rootless userns 将被拒；需安装 iso-cc apparmor profile（P3）",
+                ));
+            }
         }
     }
 
@@ -232,14 +305,29 @@ pub fn run(
                 out.push(Check::new("egress/iface", Status::Fail, e.to_string()));
             } else if sys.iface_exists(iface) {
                 out.push(Check::new("egress/iface", Status::Ok, iface));
-                let status = if sys.iface_has_default_route(iface) {
-                    Status::Ok
-                } else if sys.iface_has_route(iface) {
-                    Status::Warn
+                if mark {
+                    // mark（票 18）：tun 形态接口无 main 表路由（auto-route:false），
+                    // 管理 UP 即可；策略路由面 = 独立三元组断言（下）。
+                    let status = if sys.iface_up(iface) {
+                        Status::Ok
+                    } else {
+                        Status::Fail
+                    };
+                    out.push(Check::new(
+                        "egress/iface-up",
+                        status,
+                        format!("iface {iface} IFF_UP"),
+                    ));
                 } else {
-                    Status::Fail
-                };
-                out.push(Check::new("egress/route", status, format!("iface {iface}")));
+                    let status = if sys.iface_has_default_route(iface) {
+                        Status::Ok
+                    } else if sys.iface_has_route(iface) {
+                        Status::Warn
+                    } else {
+                        Status::Fail
+                    };
+                    out.push(Check::new("egress/route", status, format!("iface {iface}")));
+                }
             } else {
                 out.push(Check::new(
                     "egress/iface",
@@ -308,14 +396,130 @@ pub fn run(
         Err(e) => out.push(Check::new("egress/iface", Status::Fail, e.to_string())),
     }
 
+    // 2a. mark 路由面三元组 + v6 镜像（票 18；doctor 断言 rule+route+兜底，
+    // 任一缺失 = Fail 非 Warn——静默 fail-open 缓解是本票的验收核心）。
+    if mark {
+        let iface = profile.egress_iface().unwrap_or("?").to_string();
+        let (rules, routes, rules6, routes6) = (
+            sys.ip_rule_show(),
+            sys.ip_route_table(crate::config::MARK_TABLE),
+            sys.ip_rule_show6(),
+            sys.ip_route_table(crate::config::MARK_TABLE),
+        );
+        match (&rules, &rules6) {
+            (Some(r4), Some(r6)) => {
+                let v4 = crate::mark::parse_rule_show(r4);
+                let v6 = crate::mark::parse_rule_show(r6);
+                out.push(Check::new(
+                    "mark/rule",
+                    if v4 { Status::Ok } else { Status::Fail },
+                    if v4 {
+                        format!("pref {p} uidrange {u}-{u} table {t} 在位", p = crate::config::MARK_RULE_PREF, u = crate::config::MARK_UID, t = crate::config::MARK_TABLE)
+                    } else {
+                        "v4 uidrange 规则缺失（uid 流量将 fall-through main 表 = 静默 fail-open）——运行 `iso-cc setup` 并应用 rootful 步骤".to_string()
+                    },
+                ));
+                out.push(Check::new(
+                    "mark/rule-v6",
+                    if v6 { Status::Ok } else { Status::Fail },
+                    if v6 {
+                        "v6 uidrange 规则在位".to_string()
+                    } else {
+                        "v6 uidrange 规则缺失（v6 fail-closed 前提）——应用 rootful 步骤".to_string()
+                    },
+                ));
+            }
+            _ => out.push(Check::new(
+                "mark/rule",
+                Status::Fail,
+                "ip 不可用，路由面不可测（fail-loud）",
+            )),
+        }
+        if let Some(routes) = &routes {
+            let (dev, backstop) = crate::mark::parse_route_table(routes, &iface);
+            out.push(Check::new(
+                "mark/table",
+                if dev { Status::Ok } else { Status::Fail },
+                if dev {
+                    format!("表 {t} default dev {iface} 在位", t = crate::config::MARK_TABLE)
+                } else {
+                    format!("表 {} 无 default dev {iface}（tun down/up 抖动会永久丢路由——票 18 发现 2；重跑 setup rootful 块自愈）", crate::config::MARK_TABLE)
+                },
+            ));
+            out.push(Check::new(
+                "mark/table-backstop",
+                if backstop { Status::Ok } else { Status::Fail },
+                if backstop {
+                    format!("表 {} unreachable 兜底在位（fail-closed 结构面）", crate::config::MARK_TABLE)
+                } else {
+                    format!("表 {} unreachable 兜底缺失（tun down = 表空 fall-through main = 静默 fail-open，票 18 阶段 A 发现 1）——应用 rootful 步骤", crate::config::MARK_TABLE)
+                },
+            ));
+            let v6_backstop = routes6
+                .as_ref()
+                .map(|r6| crate::mark::parse_route_table(r6, &iface).1)
+                .unwrap_or(false);
+            out.push(Check::new(
+                "mark/table-v6",
+                if v6_backstop {
+                    Status::Ok
+                } else {
+                    Status::Fail
+                },
+                if v6_backstop {
+                    format!(
+                        "表 {} v6 unreachable 兜底在位（v6 恒 fail-closed）",
+                        crate::config::MARK_TABLE
+                    )
+                } else {
+                    "v6 unreachable 兜底缺失——应用 rootful 步骤".to_string()
+                },
+            ));
+        } else {
+            out.push(Check::new(
+                "mark/table",
+                Status::Fail,
+                "ip 不可用，路由面不可测（fail-loud）",
+            ));
+        }
+        // mark/DNS（票 18 已登记例外）：DNS 元数据不被 uid 钉定（WSL 解析器挂 lo
+        // pref-0），走宿主解析器；数据面 TCP 仍 fail-closed（unreachable 兜底）。
+        out.push(Check::new(
+            "mark/dns",
+            Status::Warn,
+            "DNS 元数据走宿主解析器（uid 策略路由不覆盖：登记例外，票 18 发现 3；数据面 TCP fail-closed 不受影响）",
+        ));
+        // mark/uid：DAC 隔离前提 = uid 未被既有账户占用。
+        let u = crate::config::MARK_UID;
+        let uid_used = sys.uid_in_use(u);
+        out.push(Check::new(
+            "mark/uid",
+            if uid_used { Status::Fail } else { Status::Ok },
+            if uid_used {
+                format!("uid {u} 已被账户占用（DAC 隔离前提破坏）——换 uid 需新票声明化")
+            } else {
+                format!("uid {u} 未被占用（DAC 隔离前提成立）")
+            },
+        ));
+    }
+
     // 3. locale（R2）
     if let Some(tz) = &profile.locale.tz {
-        let zpath = Path::new("/usr/share/zoneinfo").join(tz);
-        let ok = sys.path_exists(&zpath);
+        // tzdb 根因发行而异：FHS = /usr/share/zoneinfo；NixOS = /etc/zoneinfo
+        //（宿主矩阵实测，票 18 验收）。会话内 TZif 由内嵌 tzdb 生成，此检查只断言
+        // 「宿主存在该时区数据」的声明可满足性。
+        let hit = ["/usr/share/zoneinfo", "/etc/zoneinfo"]
+            .iter()
+            .find(|root| sys.path_exists(&Path::new(root).join(tz)));
         out.push(Check::new(
             "locale/zoneinfo",
-            if ok { Status::Ok } else { Status::Fail },
-            format!("/usr/share/zoneinfo/{tz}"),
+            if hit.is_some() { Status::Ok } else { Status::Fail },
+            match hit {
+                Some(root) => format!("{root}/{tz}"),
+                None => format!(
+                    "{tz} 不在 /usr/share/zoneinfo 与 /etc/zoneinfo（宿主无 tzdata？；会话内 TZ = 内嵌 tzdb，不受影响）"
+                ),
+            },
         ));
     }
     if let Some(lang) = &profile.locale.lang {
@@ -338,6 +542,8 @@ pub fn run(
     //    config 可推导路径 ∪ state_dir ∪ /proc。
     let gateway = profile.gateway();
     let bin_name = gateway.bin_name();
+    let mark_entry_hint =
+        "mark 助手/路由面清单条目缺失（fail-loud #2 清单态）——先运行 `iso-cc setup --profile <n>`";
     let entries: Vec<crate::manifest::Entry> = match sys.manifest_state() {
         Err(e) => {
             out.push(Check::new(
@@ -348,8 +554,24 @@ pub fn run(
             out.push(Check::new(
                 "provider/selected",
                 Status::Fail,
-                format!("清单不可读，无法钉定 {bin_name}（fail-loud #2 清单态）：重跑 `iso-cc setup`"),
+                if mark {
+                    "清单不可读，无法钉定 mark 助手（fail-loud #2 清单态）：重跑 `iso-cc setup`".to_string()
+                } else {
+                    format!("清单不可读，无法钉定 {bin_name}（fail-loud #2 清单态）：重跑 `iso-cc setup`")
+                },
             ));
+            if mark {
+                out.push(Check::new(
+                    "mark/cap-bin-manifest",
+                    Status::Fail,
+                    mark_entry_hint,
+                ));
+                out.push(Check::new(
+                    "mark/route-rule-manifest",
+                    Status::Fail,
+                    mark_entry_hint,
+                ));
+            }
             Vec::new()
         }
         Ok(None) => {
@@ -364,8 +586,24 @@ pub fn run(
             out.push(Check::new(
                 "provider/selected",
                 Status::Fail,
-                format!("net.gateway={gateway}：{bin_name} 绝对路径未钉定（fail-loud #2 清单态）——先运行 `iso-cc setup`；缺失报包名：passt / slirp4netns 或上游静态单文件"),
+                if mark {
+                    "mark 引擎：助手绝对路径未钉定（fail-loud #2 清单态）——先运行 `iso-cc setup`".to_string()
+                } else {
+                    format!("net.gateway={gateway}：{bin_name} 绝对路径未钉定（fail-loud #2 清单态）——先运行 `iso-cc setup`；缺失报包名：passt / slirp4netns 或上游静态单文件")
+                },
             ));
+            if mark {
+                out.push(Check::new(
+                    "mark/cap-bin-manifest",
+                    Status::Fail,
+                    mark_entry_hint,
+                ));
+                out.push(Check::new(
+                    "mark/route-rule-manifest",
+                    Status::Fail,
+                    mark_entry_hint,
+                ));
+            }
             Vec::new()
         }
         Ok(Some(entries)) => {
@@ -374,16 +612,76 @@ pub fn run(
                 Status::Ok,
                 format!("{} entries", entries.len()),
             ));
-            // forward：provider 条目 → 钉定路径可执行 + 版本一致
-            match entries.iter().find(|e| {
-                e.kind == crate::manifest::EntryKind::Provider && e.key == bin_name
-            }) {
-                None => out.push(Check::new(
+            // forward：provider 条目 → 钉定路径可执行 + 版本一致（mark 引擎无
+            // 网关 provider——改查 cap-bin/route-rule 清单门，票 18）
+            let provider_entry = entries
+                .iter()
+                .find(|e| e.kind == crate::manifest::EntryKind::Provider && e.key == bin_name);
+            match (mark, provider_entry) {
+                (true, _) => {
+                    // mark：清单门 = cap-bin + route-rule 条目在位
+                    match entries
+                        .iter()
+                        .find(|e| e.kind == crate::manifest::EntryKind::CapBin)
+                    {
+                        None => out.push(Check::new(
+                            "mark/cap-bin-manifest",
+                            Status::Fail,
+                            mark_entry_hint,
+                        )),
+                        Some(e) => {
+                            let path = e.path.clone().unwrap_or_default();
+                            if !sys.path_exists(&path) {
+                                out.push(Check::new(
+                                    "mark/cap-bin-manifest",
+                                    Status::Fail,
+                                    format!("mark 助手消失 {}（重跑 `iso-cc setup`）", path.display()),
+                                ));
+                            } else {
+                                match sys.file_caps(&path) {
+                                    None => out.push(Check::new(
+                                        "mark/cap-bin-manifest",
+                                        Status::Fail,
+                                        format!("getcap 不可用，{} capability 不可测（fail-loud；缺失报包名：libcap）", path.display()),
+                                    )),
+                                    Some(caps) if caps.contains("cap_setuid") && caps.contains("cap_setgid") && caps.contains("ep") => {
+                                        out.push(Check::new(
+                                            "mark/cap-bin-manifest",
+                                            Status::Ok,
+                                            format!("{}（{caps}）", path.display()),
+                                        ));
+                                    }
+                                    Some(caps) => out.push(Check::new(
+                                        "mark/cap-bin-manifest",
+                                        Status::Fail,
+                                        format!("{} capability 不完整（getcap={caps:?}，需 cap_setuid,cap_setgid=ep）——应用 setup rootful 步骤", path.display()),
+                                    )),
+                                }
+                            }
+                        }
+                    }
+                    match entries
+                        .iter()
+                        .find(|e| e.kind == crate::manifest::EntryKind::RouteRule)
+                    {
+                        None => out.push(Check::new(
+                            "mark/route-rule-manifest",
+                            Status::Fail,
+                            mark_entry_hint,
+                        )),
+                        Some(_) => out.push(Check::new(
+                            "mark/route-rule-manifest",
+                            Status::Ok,
+                            "路由面条目登记在位（现实面 = mark/rule* 检查组）",
+                        )),
+                    }
+                }
+                (false, None) => out.push(Check::new(
                     "provider/selected",
                     Status::Fail,
                     format!("net.gateway={gateway}：清单无 {bin_name} 条目（fail-loud #2 清单态）——先运行 `iso-cc setup --profile <n>`"),
                 )),
-                Some(entry) => {
+                (false, Some(entry)) => {
                     let path = entry.path.clone().unwrap_or_default();
                     let executable = sys.path_executable(&path);
                     if !executable {
@@ -530,12 +828,16 @@ pub fn run(
             // mountpoint（宿主跑过 cc = 预存在不纳管）。false = 无内置对（声明共享）。
             if profile.cc_isolation() {
                 let mut problems: Vec<String> = Vec::new();
-                for pair in crate::config::cc_builtin_pairs(profile_name) {
+                let pairs = if mark {
+                    crate::mark::cc_builtin_pairs_mark(profile_name)
+                } else {
+                    crate::config::cc_builtin_pairs(profile_name)
+                };
+                for pair in pairs {
                     let key = crate::setup::profile_state_key(profile_name, pair.key);
-                    match entries
-                        .iter()
-                        .find(|e| e.kind == crate::manifest::EntryKind::ProfileState && e.key == key)
-                    {
+                    match entries.iter().find(|e| {
+                        e.kind == crate::manifest::EntryKind::ProfileState && e.key == key
+                    }) {
                         None => problems.push(format!(
                             "{} backing {} 未登记（setup 未跑）",
                             pair.key,
@@ -545,7 +847,10 @@ pub fn run(
                             problems.push(format!(
                                 "{} 登记路径漂移：{} ≠ config 推导 {}",
                                 pair.key,
-                                e.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                                e.path
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_default(),
                                 pair.backing.display()
                             ));
                         }
@@ -558,16 +863,35 @@ pub fn run(
                         }
                         Some(_) => {}
                     }
-                    let view_registered = entries.iter().any(|e| {
-                        e.kind == crate::manifest::EntryKind::Mountpoint
-                            && e.path.as_ref() == Some(&pair.view)
-                    });
-                    if !sys.path_exists(&pair.view) && !view_registered {
-                        problems.push(format!(
-                            "{} view {} 缺失且未登记（run 将 fail-loud）——先运行 `iso-cc setup`",
-                            pair.key,
-                            pair.view.display()
-                        ));
+                    // mark 引擎（票 18）：view 路径/mountpoint 不适用（隔离 =
+                    // HOME 重写 + uid DAC）——改断言 backing 属主 = mark uid
+                    //（chown 未应用 = cc 无法写状态，run 前预检同源）。
+                    if mark {
+                        match sys.path_owner_uid(&pair.backing) {
+                            Some(uid) if uid == crate::config::MARK_UID => {}
+                            Some(uid) => problems.push(format!(
+                                "{} backing 属主 = {uid} ≠ {}：rootful chown 未应用——应用 setup rootful 步骤",
+                                pair.key,
+                                crate::config::MARK_UID
+                            )),
+                            None => problems.push(format!(
+                                "{} backing {} 不可 stat（重跑 `iso-cc setup`）",
+                                pair.key,
+                                pair.backing.display()
+                            )),
+                        }
+                    } else {
+                        let view_registered = entries.iter().any(|e| {
+                            e.kind == crate::manifest::EntryKind::Mountpoint
+                                && e.path.as_ref() == Some(&pair.view)
+                        });
+                        if !sys.path_exists(&pair.view) && !view_registered {
+                            problems.push(format!(
+                                "{} view {} 缺失且未登记（run 将 fail-loud）——先运行 `iso-cc setup`",
+                                pair.key,
+                                pair.view.display()
+                            ));
+                        }
                     }
                 }
                 if problems.is_empty() {
@@ -590,8 +914,12 @@ pub fn run(
             } else {
                 out.push(Check::new(
                     "manifest/cc-builtin",
-                    Status::Ok,
-                    "cc_isolation=false：无内置对（与宿主共享 = 声明语义）",
+                    if mark { Status::Warn } else { Status::Ok },
+                    if mark {
+                        "cc_isolation=false + mark：宿主 cc 状态对 uid 4210 DAC 不可写（共享 = 声明语义；cc 大概率无法落状态，票 18）"
+                    } else {
+                        "cc_isolation=false：无内置对（与宿主共享 = 声明语义）"
+                    },
                 ));
             }
             // reverse：stale 条目（指向已消失 profile）= Warn + prune 提示
@@ -602,20 +930,19 @@ pub fn run(
                         e.kind,
                         crate::manifest::EntryKind::Mountpoint
                             | crate::manifest::EntryKind::ProfileState
+                            | crate::manifest::EntryKind::CapBin
+                            | crate::manifest::EntryKind::RouteRule
                     )
                 })
                 .filter_map(|e| {
-                    e.key.split_once(':').map(|(p, _)| p).and_then(|p| {
-                        (!_cfg.profile.contains_key(p)).then(|| e.key.clone())
-                    })
+                    e.key
+                        .split_once(':')
+                        .map(|(p, _)| p)
+                        .and_then(|p| (!_cfg.profile.contains_key(p)).then(|| e.key.clone()))
                 })
                 .collect();
             if stale.is_empty() {
-                out.push(Check::new(
-                    "manifest/stale",
-                    Status::Ok,
-                    "无 stale 条目",
-                ));
+                out.push(Check::new("manifest/stale", Status::Ok, "无 stale 条目"));
             } else {
                 out.push(Check::new(
                     "manifest/stale",
@@ -693,7 +1020,10 @@ pub fn run(
             out.push(Check::new(
                 "manifest/redirect-registered",
                 Status::Ok,
-                format!("redirect {} 条（挂载点缺失 = 0 或已登记）", profile.redirect.len()),
+                format!(
+                    "redirect {} 条（挂载点缺失 = 0 或已登记）",
+                    profile.redirect.len()
+                ),
             ));
         } else {
             out.push(Check::new(
@@ -830,12 +1160,20 @@ mod tests {
         max_ns: String,
         clone_switch: Option<String>,
         iface: bool,
+        iface_up: bool,
         default_route: bool,
         residue: LifecycleResidue,
         manifest: Result<Option<Vec<crate::manifest::Entry>>, String>,
         exec_ok: bool,
         /// socks geo 预检注入（工单 16）：None = 探测不可达（Err）。
         socks_geo: Option<Result<String, String>>,
+        /// mark 引擎注入（票 18）。
+        mark_rules: Option<String>,
+        mark_rules6: Option<String>,
+        mark_table: Option<String>,
+        mark_caps: Option<String>,
+        mark_uid_used: bool,
+        mark_owner: Option<u32>,
     }
 
     impl Default for FakeSys {
@@ -844,11 +1182,26 @@ mod tests {
                 max_ns: "1024".into(),
                 clone_switch: None,
                 iface: true,
+                iface_up: true,
                 default_route: true,
                 residue: LifecycleResidue::default(),
                 manifest: Ok(Some(default_manifest())),
                 exec_ok: true,
                 socks_geo: None,
+                mark_rules: Some(
+                    "15000:\tfrom all uidrange 4210-4210 lookup 5182\n32766:\tfrom all lookup main\n"
+                        .into(),
+                ),
+                mark_rules6: Some(
+                    "15000:\tfrom all uidrange 4210-4210 lookup 5182\n32766:\tfrom all lookup main\n"
+                        .into(),
+                ),
+                mark_table: Some(
+                    "default dev mihomo-tun metric 100\nunreachable default metric 2048\n".into(),
+                ),
+                mark_caps: Some("".into()),
+                mark_uid_used: false,
+                mark_owner: Some(crate::config::MARK_UID),
             }
         }
     }
@@ -906,13 +1259,36 @@ mod tests {
             _host: &str,
             _path: &str,
         ) -> Result<String, String> {
-            self.socks_geo.clone().unwrap_or_else(|| Err("探测不可达".into()))
+            self.socks_geo
+                .clone()
+                .unwrap_or_else(|| Err("探测不可达".into()))
         }
         fn lifecycle_residue(&self) -> LifecycleResidue {
             self.residue.clone()
         }
         fn manifest_state(&self) -> Result<Option<Vec<crate::manifest::Entry>>, String> {
             self.manifest.clone()
+        }
+        fn ip_rule_show(&self) -> Option<String> {
+            self.mark_rules.clone()
+        }
+        fn ip_rule_show6(&self) -> Option<String> {
+            self.mark_rules6.clone()
+        }
+        fn ip_route_table(&self, _table: u32) -> Option<String> {
+            self.mark_table.clone()
+        }
+        fn file_caps(&self, _path: &Path) -> Option<String> {
+            self.mark_caps.clone()
+        }
+        fn iface_up(&self, _name: &str) -> bool {
+            self.iface_up
+        }
+        fn uid_in_use(&self, _uid: u32) -> bool {
+            self.mark_uid_used
+        }
+        fn path_owner_uid(&self, _path: &Path) -> Option<u32> {
+            self.mark_owner
         }
     }
 
@@ -1104,14 +1480,10 @@ mod tests {
         let p: Profile = toml::from_str("egress = 'if:wg0'\nnet.gateway = 'slirp4netns'").unwrap();
         let sys = FakeSys {
             manifest: Ok(Some(
-                vec![mentry(
-                    "slirp4netns",
-                    "/usr/bin/fake",
-                    Some("1.0.0"),
-                )]
-                .into_iter()
-                .chain(ps_entries("x"))
-                .collect(),
+                vec![mentry("slirp4netns", "/usr/bin/fake", Some("1.0.0"))]
+                    .into_iter()
+                    .chain(ps_entries("x"))
+                    .collect(),
             )),
             ..Default::default()
         };
@@ -1204,8 +1576,7 @@ mod tests {
     #[test]
     fn cc_isolation_false_axis_has_no_builtin_demand() {
         // false 轴：不要求内置对登记（与宿主共享 = 声明语义）
-        let p: Profile =
-            toml::from_str("egress = 'if:wg0'\nagent.cc_isolation = false").unwrap();
+        let p: Profile = toml::from_str("egress = 'if:wg0'\nagent.cc_isolation = false").unwrap();
         let sys = FakeSys {
             manifest: Ok(Some(vec![mentry("pasta", "/usr/bin/fake", Some("1.0.0"))])),
             ..Default::default()
@@ -1243,8 +1614,12 @@ mod tests {
             &p,
             &sys,
         );
-        assert!(checks.iter().any(|c| c.name == "manifest/state" && c.status == Status::Fail));
-        assert!(checks.iter().any(|c| c.name == "provider/selected" && c.status == Status::Fail));
+        assert!(checks
+            .iter()
+            .any(|c| c.name == "manifest/state" && c.status == Status::Fail));
+        assert!(checks
+            .iter()
+            .any(|c| c.name == "provider/selected" && c.status == Status::Fail));
     }
 
     #[test]
@@ -1334,7 +1709,8 @@ mod tests {
     #[test]
     fn unregistered_missing_redirect_fails() {
         let p: Profile =
-            toml::from_str("egress = 'if:wg0'\nredirect = ['/tmp/src-x=/nonexistent/dst-x']").unwrap();
+            toml::from_str("egress = 'if:wg0'\nredirect = ['/tmp/src-x=/nonexistent/dst-x']")
+                .unwrap();
         let sys = FakeSys {
             manifest: Ok(Some(Vec::new())),
             ..Default::default()
@@ -1399,8 +1775,12 @@ mod tests {
             &p,
             &sys,
         );
-        assert!(checks.iter().any(|c| c.name == "manifest/state" && c.status == Status::Fail));
-        assert!(checks.iter().any(|c| c.name == "provider/selected" && c.status == Status::Fail));
+        assert!(checks
+            .iter()
+            .any(|c| c.name == "manifest/state" && c.status == Status::Fail));
+        assert!(checks
+            .iter()
+            .any(|c| c.name == "provider/selected" && c.status == Status::Fail));
     }
 
     #[test]
@@ -1408,7 +1788,11 @@ mod tests {
         // 钉定路径可执行位缺失 = Fail（#2 清单态）
         let sys = FakeSys {
             exec_ok: false,
-            manifest: Ok(Some(vec![mentry("pasta", "/nonexistent/bin/pasta", Some("1.0.0"))])),
+            manifest: Ok(Some(vec![mentry(
+                "pasta",
+                "/nonexistent/bin/pasta",
+                Some("1.0.0"),
+            )])),
             ..Default::default()
         };
         let p = profile("if:wg0");
@@ -1509,12 +1893,15 @@ mod tests {
         let sys = FakeSys {
             manifest: Ok(Some(m.clone())),
             socks_geo: Some(Ok(
-                r#"{"timezone":"Asia/Singapore","countryCode":"SG"}"#.into(),
+                r#"{"timezone":"Asia/Singapore","countryCode":"SG"}"#.into()
             )),
             ..Default::default()
         };
         let checks = socks_checks(&sys, toml);
-        let geo = checks.iter().find(|c| c.name == "egress/socks-geo").unwrap();
+        let geo = checks
+            .iter()
+            .find(|c| c.name == "egress/socks-geo")
+            .unwrap();
         assert_eq!(geo.status, Status::Fail, "{}", geo.detail);
         assert!(geo.detail.contains("≠ 声明 Asia/Tokyo"), "{}", geo.detail);
         // 探测不可达 = Warn（advisory；verify P13 为权威）
@@ -1524,7 +1911,10 @@ mod tests {
             ..Default::default()
         };
         let checks = socks_checks(&sys, toml);
-        let geo = checks.iter().find(|c| c.name == "egress/socks-geo").unwrap();
+        let geo = checks
+            .iter()
+            .find(|c| c.name == "egress/socks-geo")
+            .unwrap();
         assert_eq!(geo.status, Status::Warn, "{}", geo.detail);
         assert!(!any_fail(&checks), "不可达 geo 只应 Warn：{checks:?}");
     }
@@ -1603,5 +1993,189 @@ mod tests {
         assert_eq!(worker.status, Status::Fail, "{}", worker.detail);
         assert!(worker.detail.contains("setup"), "{}", worker.detail);
         assert!(any_fail(&checks));
+    }
+
+    // ===== mark 引擎（票 18）=====
+
+    fn mark_checks(sys: &FakeSys, extra: &str) -> Vec<Check> {
+        let p: Profile = toml::from_str(&format!(
+            "egress = 'if:mihomo-tun'\nnet.engine = 'mark'\nlocale.tz = 'Asia/Singapore'\n{extra}"
+        ))
+        .unwrap();
+        run(
+            &Config {
+                version: 1,
+                profile: Default::default(),
+            },
+            "sg",
+            &p,
+            sys,
+        )
+    }
+
+    fn mark_manifest() -> Vec<crate::manifest::Entry> {
+        let mut m = vec![mentry("pasta", "/usr/bin/fake", Some("1.0.0"))]
+            .into_iter()
+            .chain(crate::config::cc_builtin_pairs("sg").into_iter().map(|pair| {
+                // mark 引擎：backing 落 mark 状态根（cc_builtin_pairs_mark 推导一致）
+                crate::manifest::Entry {
+                    kind: crate::manifest::EntryKind::ProfileState,
+                    key: crate::setup::profile_state_key("sg", pair.key),
+                    path: Some(crate::mark::profiles_root().join("sg").join(pair.key)),
+                    version: None,
+                    registered_at: 1_760_000_000_000,
+                    reason: "测试登记".into(),
+                }
+            }))
+            .collect::<Vec<_>>();
+        m.push(crate::manifest::Entry {
+            kind: crate::manifest::EntryKind::CapBin,
+            key: "sg:uidrun".into(),
+            path: Some(crate::mark::helper_path()),
+            version: None,
+            registered_at: 1_760_000_000_000,
+            reason: "测试登记".into(),
+        });
+        m.push(crate::manifest::Entry {
+            kind: crate::manifest::EntryKind::RouteRule,
+            key: "sg:route-rule".into(),
+            path: None,
+            version: None,
+            registered_at: 1_760_000_000_000,
+            reason: "测试登记".into(),
+        });
+        m
+    }
+
+    fn mark_sys() -> FakeSys {
+        FakeSys {
+            manifest: Ok(Some(mark_manifest())),
+            mark_caps: Some("cap_setgid=ep cap_setuid=ep".into()),
+            ..Default::default()
+        }
+    }
+
+    fn check<'a>(checks: &'a [Check], name: &str) -> &'a Check {
+        checks
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("检查 {name} 存在：{checks:?}"))
+    }
+
+    #[test]
+    fn mark_healthy_is_all_ok_and_netns_checks_skipped() {
+        let checks = mark_checks(&mark_sys(), "");
+        assert!(!any_fail(&checks), "{checks:?}");
+        // netns 专属检查组缺席（userns/provider pasta/socks worker）
+        assert!(checks.iter().all(|c| !c.name.starts_with("userns/")));
+        assert!(checks.iter().all(|c| c.name != "provider/selected"));
+        // mark 检查组在位且全绿
+        for name in [
+            "mark/rule",
+            "mark/rule-v6",
+            "mark/table",
+            "mark/table-backstop",
+            "mark/table-v6",
+            "mark/cap-bin-manifest",
+            "mark/route-rule-manifest",
+            "mark/uid",
+        ] {
+            assert_eq!(check(&checks, name).status, Status::Ok, "{name}");
+        }
+        // DNS 登记例外 = Warn 常驻
+        assert_eq!(check(&checks, "mark/dns").status, Status::Warn);
+    }
+
+    #[test]
+    fn mark_rule_missing_is_fail() {
+        let sys = FakeSys {
+            mark_rules: None,
+            ..mark_sys()
+        };
+        let checks = mark_checks(&sys, "");
+        assert_eq!(check(&checks, "mark/rule").status, Status::Fail);
+        assert!(any_fail(&checks));
+    }
+
+    #[test]
+    fn mark_table_dev_route_lost_is_fail() {
+        // 阶段 A 发现 2：tun down/up 抖动永久丢 dev 路由 → doctor 必须 Fail
+        let sys = FakeSys {
+            mark_table: Some("unreachable default metric 2048\n".into()),
+            ..mark_sys()
+        };
+        let checks = mark_checks(&sys, "");
+        let c = check(&checks, "mark/table");
+        assert_eq!(c.status, Status::Fail, "{}", c.detail);
+        assert!(c.detail.contains("抖动"), "{}", c.detail);
+        // 兜底仍在 → backstop 单项不误报
+        assert_eq!(check(&checks, "mark/table-backstop").status, Status::Ok);
+    }
+
+    #[test]
+    fn mark_backstop_missing_is_fail() {
+        // 阶段 A 发现 1：无兜底 = tun down 静默 fail-open → Fail
+        let sys = FakeSys {
+            mark_table: Some("default dev mihomo-tun metric 100\n".into()),
+            ..mark_sys()
+        };
+        let checks = mark_checks(&sys, "");
+        let c = check(&checks, "mark/table-backstop");
+        assert_eq!(c.status, Status::Fail, "{}", c.detail);
+        assert!(c.detail.contains("fail-open"), "{}", c.detail);
+        assert_eq!(check(&checks, "mark/table").status, Status::Ok);
+    }
+
+    #[test]
+    fn mark_helper_caps_missing_is_fail() {
+        let sys = FakeSys {
+            mark_caps: Some("".into()),
+            ..mark_sys()
+        };
+        let checks = mark_checks(&sys, "");
+        let c = check(&checks, "mark/cap-bin-manifest");
+        assert_eq!(c.status, Status::Fail, "{}", c.detail);
+        assert!(
+            c.detail.contains("setcap") || c.detail.contains("cap_setuid"),
+            "{}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn mark_uid_in_use_is_fail() {
+        let sys = FakeSys {
+            mark_uid_used: true,
+            ..mark_sys()
+        };
+        let checks = mark_checks(&sys, "");
+        assert_eq!(check(&checks, "mark/uid").status, Status::Fail);
+    }
+
+    #[test]
+    fn mark_backing_ownership_unapplied_is_fail() {
+        // rootful chown 未应用 → cc 不可写状态 → cc-builtin Fail
+        let sys = FakeSys {
+            mark_owner: Some(1000),
+            ..mark_sys()
+        };
+        let checks = mark_checks(&sys, "");
+        let c = check(&checks, "manifest/cc-builtin");
+        assert_eq!(c.status, Status::Fail, "{}", c.detail);
+        assert!(c.detail.contains("chown"), "{}", c.detail);
+    }
+
+    #[test]
+    fn mark_route_face_absent_fail_loud_not_warn() {
+        // ip 不可用 = 路由面不可测 = Fail（绝不静默）
+        let sys = FakeSys {
+            mark_rules: None,
+            mark_rules6: None,
+            mark_table: None,
+            ..mark_sys()
+        };
+        let checks = mark_checks(&sys, "");
+        assert_eq!(check(&checks, "mark/rule").status, Status::Fail);
+        assert_eq!(check(&checks, "mark/table").status, Status::Fail);
     }
 }

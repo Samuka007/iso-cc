@@ -2,8 +2,8 @@
 //! argv 展开是 plan 打印与实际 spawn 的单一事实源（§7 D5：`--print-plan` 终点 = 等价 CLI 组合）。
 
 pub mod pasta;
-pub mod socks;
 pub mod slirp;
+pub mod socks;
 
 use crate::config::NetGateway;
 use anyhow::{anyhow, bail, Context};
@@ -61,7 +61,10 @@ pub(crate) fn version_output(bin: &Path) -> anyhow::Result<String> {
         .unwrap_or_default()
         .to_string();
     if v.is_empty() {
-        anyhow::bail!("{} --version 无 stdout（版本事实缺失，fail-loud）", bin.display());
+        anyhow::bail!(
+            "{} --version 无 stdout（版本事实缺失，fail-loud）",
+            bin.display()
+        );
     }
     Ok(v)
 }
@@ -72,22 +75,27 @@ pub(crate) fn version_output(bin: &Path) -> anyhow::Result<String> {
 /// gateway（pasta/slirp4netns）与 socks worker（tun2proxy）共用本门。
 pub fn pinned_bin(name: &str) -> anyhow::Result<PathBuf> {
     let manifest = crate::manifest::read().map_err(|e| {
-        anyhow!("清单不可读（fail-loud #2）：{e}；修复或删除 {} 后重跑 `iso-cc setup`",
-            crate::manifest::manifest_path().display())
+        anyhow!(
+            "清单不可读（fail-loud #2）：{e}；修复或删除 {} 后重跑 `iso-cc setup`",
+            crate::manifest::manifest_path().display()
+        )
     })?;
     let Some(m) = manifest else {
         anyhow::bail!(
             "清单缺失（fail-loud #2）：provider {name} 绝对路径未钉定——先运行 `iso-cc setup`"
         )
     };
-    let entry = m.find(crate::manifest::EntryKind::Provider, name).ok_or_else(|| {
-        anyhow!(
-            "清单无 {name} 条目（fail-loud #2）：未登记——先运行 `iso-cc setup --profile <n>`"
-        )
-    })?;
-    let path = entry.path.clone().ok_or_else(|| {
-        anyhow!("清单 {name} 条目缺 path（清单损坏）——重跑 `iso-cc setup` 收敛")
-    })?;
+    let entry = m
+        .find(crate::manifest::EntryKind::Provider, name)
+        .ok_or_else(|| {
+            anyhow!(
+                "清单无 {name} 条目（fail-loud #2）：未登记——先运行 `iso-cc setup --profile <n>`"
+            )
+        })?;
+    let path = entry
+        .path
+        .clone()
+        .ok_or_else(|| anyhow!("清单 {name} 条目缺 path（清单损坏）——重跑 `iso-cc setup` 收敛"))?;
     let executable = std::fs::metadata(&path)
         .map(|m| m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false);

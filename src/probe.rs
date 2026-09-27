@@ -85,12 +85,7 @@ pub fn p8_violations(write_set: &[PathBuf], allowed_roots: &[PathBuf]) -> Vec<Pa
 fn p8_write_set(home: &Path, marker: &Path) -> Option<Vec<PathBuf>> {
     let (code, out) = sh_out(
         "find",
-        &[
-            home.to_str()?,
-            "-newer",
-            marker.to_str()?,
-            "-print",
-        ],
+        &[home.to_str()?, "-newer", marker.to_str()?, "-print"],
     )?;
     (code == 0).then(|| {
         out.lines()
@@ -407,11 +402,11 @@ mod tests {
     fn p8_passes_write_inside_declared_or_whitelist() {
         let home = PathBuf::from("/home/u");
         let ws = vec![
-            home.join(".claude/foo"),                       // 内置对 view 内
-            home.join(".claude/projects/x.jsonl"),          // view 孙路径
-            home.join(".claude.json"),                      // 等于根
+            home.join(".claude/foo"),                                // 内置对 view 内
+            home.join(".claude/projects/x.jsonl"),                   // view 孙路径
+            home.join(".claude.json"),                               // 等于根
             home.join(".local/state/iso-cc/sessions/s/gateway.log"), // 工具状态根
-            home.join(".vscode/extensions/pub.ext"),        // R4 白名单
+            home.join(".vscode/extensions/pub.ext"),                 // R4 白名单
         ];
         assert!(p8_violations(&ws, &roots(&home)).is_empty());
     }
@@ -431,7 +426,10 @@ mod tests {
     fn p8_component_boundary_no_string_prefix_escape() {
         // 组件级前缀：`.vscode/extensions-evil` 不是 `.vscode/extensions` 的子孙
         let home = PathBuf::from("/home/u");
-        let ws = vec![home.join(".vscode/extensions-evil/x"), home.join(".claudej")];
+        let ws = vec![
+            home.join(".vscode/extensions-evil/x"),
+            home.join(".claudej"),
+        ];
         let v = p8_violations(&ws, &roots(&home));
         assert_eq!(v.len(), 2, "{v:?}");
     }

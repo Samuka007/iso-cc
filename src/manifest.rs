@@ -33,6 +33,14 @@ pub enum EntryKind {
     Mountpoint,
     /// 按 profile 的持久态（预留）。key = `<profile>:<名>`；仅随显式 --profile 回收。
     ProfileState,
+    /// mark 引擎 file-cap 助手（票 18：持久 capability = setup-manifested）。
+    /// key = `<profile>:uidrun`；path = 二进制绝对路径；gc 实删文件（本工具所有）。
+    CapBin,
+    /// mark 引擎策略路由面（票 18：uidrange rule + 表 5182 双路由 + unreachable
+    /// 兜底 + v6 镜像）。key = `<profile>:route-rule`；path = None（宿主路由原语，
+    /// 常量面见 config::MARK_*）；回收 = 除名 + 打印 rootful 回滚命令（flush 表 +
+    /// del 规则，/tmp/iso-cc-exp18/rollback.sh 同源）。
+    RouteRule,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,7 +74,11 @@ impl Manifest {
 
     /// 同 (kind, key) 替换（provider upsert：仅 path/version 变化时调用方才应调）。
     pub fn upsert(&mut self, entry: Entry) {
-        match self.entries.iter().position(|e| e.kind == entry.kind && e.key == entry.key) {
+        match self
+            .entries
+            .iter()
+            .position(|e| e.kind == entry.kind && e.key == entry.key)
+        {
             Some(i) => self.entries[i] = entry,
             None => self.entries.push(entry),
         }
@@ -120,8 +132,12 @@ pub fn read_from(path: &Path) -> anyhow::Result<Option<Manifest>> {
 
 /// 解析 + schema fail-loud（#1 机制：不认识的版本即报错）。
 pub fn parse(text: &str, path: &Path) -> anyhow::Result<Manifest> {
-    let m: Manifest = serde_json::from_str(text)
-        .with_context(|| format!("解析清单 {}（fail-loud：结构未知，deny_unknown_fields）", path.display()))?;
+    let m: Manifest = serde_json::from_str(text).with_context(|| {
+        format!(
+            "解析清单 {}（fail-loud：结构未知，deny_unknown_fields）",
+            path.display()
+        )
+    })?;
     if m.schema != SCHEMA {
         bail!(
             "清单 schema = {} 不支持（本工具支持 {SCHEMA}）：{}（fail-loud）",
@@ -141,8 +157,7 @@ pub fn save_to(m: &Manifest, path: &Path) -> anyhow::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("清单路径无父目录：{}", path.display()))?;
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("创建清单目录 {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("创建清单目录 {}", dir.display()))?;
     let mut f = tempfile::NamedTempFile::new_in(dir)
         .with_context(|| format!("tempfile 创建于 {}", dir.display()))?;
     serde_json::to_writer_pretty(&mut f, m).context("序列化清单")?;
@@ -150,7 +165,13 @@ pub fn save_to(m: &Manifest, path: &Path) -> anyhow::Result<()> {
     f.flush().context("flush 清单")?;
     let _ = f.as_file().sync_all();
     f.persist(path)
-        .map_err(|e| anyhow::anyhow!("清单原子落盘失败（persist {}）：{}", path.display(), e.error))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "清单原子落盘失败（persist {}）：{}",
+                path.display(),
+                e.error
+            )
+        })
         .map(|_| ())
 }
 
@@ -172,9 +193,24 @@ mod tests {
     #[test]
     fn roundtrip_and_kind_naming() {
         let mut m = Manifest::empty();
-        m.upsert(entry(EntryKind::Provider, "pasta", Some("/x/pasta"), Some("v1")));
-        m.insert_new_only(entry(EntryKind::Mountpoint, "p:/tmp/a", Some("/tmp/a"), None));
-        m.insert_new_only(entry(EntryKind::ProfileState, "p:state", Some("/tmp/s"), None));
+        m.upsert(entry(
+            EntryKind::Provider,
+            "pasta",
+            Some("/x/pasta"),
+            Some("v1"),
+        ));
+        m.insert_new_only(entry(
+            EntryKind::Mountpoint,
+            "p:/tmp/a",
+            Some("/tmp/a"),
+            None,
+        ));
+        m.insert_new_only(entry(
+            EntryKind::ProfileState,
+            "p:state",
+            Some("/tmp/s"),
+            None,
+        ));
         let json = serde_json::to_string(&m).unwrap();
         assert!(json.contains("\"profile-state\""), "{json}");
         assert!(json.contains("\"schema\":1"), "{json}");
@@ -190,11 +226,7 @@ mod tests {
 
     #[test]
     fn unknown_field_rejected() {
-        let err = parse(
-            r#"{"schema":1,"entries":[],"extra":1}"#,
-            Path::new("/x"),
-        )
-        .unwrap_err();
+        let err = parse(r#"{"schema":1,"entries":[],"extra":1}"#, Path::new("/x")).unwrap_err();
         // anyhow 顶层 Display = context；deny_unknown 的事实在错误链里（{:#} 全链）
         assert!(format!("{err:#}").contains("unknown field"), "{err:#}");
     }
@@ -202,7 +234,9 @@ mod tests {
     #[test]
     fn missing_file_is_none_not_error() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_from(&dir.path().join("absent.json")).unwrap().is_none());
+        assert!(read_from(&dir.path().join("absent.json"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -210,7 +244,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("manifest.json");
         let mut m = Manifest::empty();
-        m.upsert(entry(EntryKind::Provider, "slirp4netns", Some("/x/s"), Some("1.3.5")));
+        m.upsert(entry(
+            EntryKind::Provider,
+            "slirp4netns",
+            Some("/x/s"),
+            Some("1.3.5"),
+        ));
         save_to(&m, &p).unwrap();
         let back = read_from(&p).unwrap().unwrap();
         assert_eq!(back, m);
@@ -224,9 +263,20 @@ mod tests {
         let mut m = Manifest::empty();
         assert!(m.insert_new_only(entry(EntryKind::Mountpoint, "p:/a", Some("/a"), None)));
         assert!(!m.insert_new_only(entry(EntryKind::Mountpoint, "p:/a", Some("/a"), None)));
-        m.upsert(entry(EntryKind::Provider, "pasta", Some("/new"), Some("v2")));
+        m.upsert(entry(
+            EntryKind::Provider,
+            "pasta",
+            Some("/new"),
+            Some("v2"),
+        ));
         assert_eq!(m.entries.len(), 2);
-        assert_eq!(m.find(EntryKind::Provider, "pasta").unwrap().version.as_deref(), Some("v2"));
+        assert_eq!(
+            m.find(EntryKind::Provider, "pasta")
+                .unwrap()
+                .version
+                .as_deref(),
+            Some("v2")
+        );
     }
 
     #[test]

@@ -85,13 +85,14 @@ pub fn scan() -> Vec<Session> {
     let mut out = Vec::new();
     for p in scan_procs() {
         let gw = gateway_kind(&p.cmdline);
-        if p.marker.is_none() && gw.is_none() {
+        // mark 会话根（票 18）：uid 4210 树的 environ 对宿主 EACCES（setuid 非规则
+        // dumpable），env 标记键不可读——argv `--session-id` 键兜底（cmdline 全局可读；
+        // 常驻助手 cmdline 恒带该 flag，见 session::spawn_mark）。
+        let argv_id = argv_session_id(&p.cmdline);
+        if p.marker.is_none() && gw.is_none() && argv_id.is_none() {
             continue;
         }
-        let id = p
-            .marker
-            .or_else(|| argv_session_id(&p.cmdline))
-            .unwrap_or_else(|| "?".into());
+        let id = p.marker.or(argv_id).unwrap_or_else(|| "?".into());
         out.push(Session {
             pid: p.pid,
             id,
@@ -117,7 +118,9 @@ pub fn sweep_from(procs: &[ProcFacts], dirs: &[String]) -> LifecycleResidue {
     let mut cc_ids: BTreeSet<&str> = BTreeSet::new();
     let mut live_netns: BTreeSet<u64> = BTreeSet::new();
     for p in procs {
-        let Some(marker) = p.marker.as_deref() else { continue };
+        let Some(marker) = p.marker.as_deref() else {
+            continue;
+        };
         if gateway_kind(&p.cmdline).is_some() {
             continue;
         }
@@ -126,9 +129,21 @@ pub fn sweep_from(procs: &[ProcFacts], dirs: &[String]) -> LifecycleResidue {
             live_netns.insert(ns);
         }
     }
+    // mark 会话根（票 18）：environ EACCES → marker 键不可得，argv id 兜底
+    //（gateway 指纹进程仍走 gateway 归属键，不入 cc 集）。
+    let argv_ids: Vec<String> = procs
+        .iter()
+        .filter(|p| p.marker.is_none() && gateway_kind(&p.cmdline).is_none())
+        .filter_map(|p| argv_session_id(&p.cmdline))
+        .collect();
+    for id in &argv_ids {
+        cc_ids.insert(id.as_str());
+    }
     let mut gateways = Vec::new();
     for p in procs {
-        let Some(kind) = gateway_kind(&p.cmdline) else { continue };
+        let Some(kind) = gateway_kind(&p.cmdline) else {
+            continue;
+        };
         let sid = p.marker.clone().or_else(|| argv_session_id(&p.cmdline));
         let owned = sid.as_deref().is_some_and(|s| cc_ids.contains(s))
             || p.netns.is_some_and(|ns| live_netns.contains(&ns));
@@ -212,10 +227,7 @@ fn read_cmdline(pid: u32) -> Vec<String> {
 fn netns_inode(pid: u32) -> Option<u64> {
     let target = std::fs::read_link(format!("/proc/{pid}/ns/net")).ok()?;
     let s = target.to_string_lossy();
-    s.strip_prefix("net:[")?
-        .strip_suffix(']')?
-        .parse()
-        .ok()
+    s.strip_prefix("net:[")?.strip_suffix(']')?.parse().ok()
 }
 
 /// /proc/<pid>/stat 第 4 字段（ppid）；comm 可含空格/括号 → 从最后一个 `)` 后解析。
@@ -228,17 +240,22 @@ fn read_ppid(pid: u32) -> Option<u32> {
 }
 
 /// sessions/ 下的目录名（= 会话 id 集合；枚举基础，spawn() 09 期建立）。
+/// 票 18：mark 引擎会话资产在 /var/tmp/iso-cc-mark/sessions（跨 uid 可达根），
+/// 与 netns 的 state 根一并枚举（同一 id 命名空间，sweep/gc 对账共用）。
 fn session_dir_names() -> Vec<String> {
-    let Ok(root) = crate::session::sessions_root() else {
-        return Vec::new();
-    };
-    match std::fs::read_dir(&root) {
-        Ok(rd) => rd
-            .flatten()
-            .filter_map(|e| e.file_name().into_string().ok())
-            .collect(),
-        Err(_) => Vec::new(),
+    let mut names = BTreeSet::new();
+    for root in [
+        crate::session::sessions_root().ok(),
+        Some(crate::mark::sessions_root()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(rd) = std::fs::read_dir(&root) {
+            names.extend(rd.flatten().filter_map(|e| e.file_name().into_string().ok()));
+        }
     }
+    names.into_iter().collect()
 }
 
 pub fn render_human(sessions: &[Session]) -> String {
@@ -293,8 +310,14 @@ mod tests {
     #[test]
     fn passt_reexec_comm_shape_still_fingerprints() {
         // pasta re-exec 后 argv0 保留原样；argv0 基名兜底覆盖手工改名场景
-        assert_eq!(gateway_kind(&cmdline(&["/usr/bin/passt.avx2", "-f"])), Some("pasta"));
-        assert_eq!(gateway_kind(&cmdline(&["slirp4netns", "1", "tap0", "-c"])), Some("slirp4netns"));
+        assert_eq!(
+            gateway_kind(&cmdline(&["/usr/bin/passt.avx2", "-f"])),
+            Some("pasta")
+        );
+        assert_eq!(
+            gateway_kind(&cmdline(&["slirp4netns", "1", "tap0", "-c"])),
+            Some("slirp4netns")
+        );
         assert_eq!(gateway_kind(&cmdline(&["bash", "-c", "true"])), None);
     }
 
@@ -321,7 +344,12 @@ mod tests {
         let procs = vec![
             // 两会话 cc 树：标记 + netns inode 可读
             facts(199, Some("s-1"), &["bash", "-c", "sleep"], Some(4026538888)),
-            facts(200, Some("pasta-7"), &["bash", "-c", "sleep"], Some(4026539999)),
+            facts(
+                200,
+                Some("pasta-7"),
+                &["bash", "-c", "sleep"],
+                Some(4026539999),
+            ),
             // pasta 本体：netns EACCES（None），argv id 键命中 cc 集
             facts(
                 201,
@@ -342,7 +370,12 @@ mod tests {
                 None,
             ),
             // slirp 网关：env 标记键命中
-            facts(202, Some("s-1"), &["slirp4netns", "199", "tap0", "-c"], None),
+            facts(
+                202,
+                Some("s-1"),
+                &["slirp4netns", "199", "tap0", "-c"],
+                None,
+            ),
         ];
         let r = sweep_from(&procs, &["pasta-7".to_string(), "crash-9".to_string()]);
         assert!(r.gateways.is_empty(), "{r:?}");
@@ -379,9 +412,36 @@ mod tests {
         // netns 键独立成立：标记不可读但持有活跃会话 netns 的网关形态不算 residue
         let procs = vec![
             facts(500, Some("pasta-9"), &["bash"], Some(4026537777)),
-            facts(501, None, &["slirp4netns", "500", "tap0", "-c"], Some(4026537777)),
+            facts(
+                501,
+                None,
+                &["slirp4netns", "500", "tap0", "-c"],
+                Some(4026537777),
+            ),
         ];
         let r = sweep_from(&procs, &[]);
         assert!(r.gateways.is_empty(), "{r:?}");
+    }
+
+    #[test]
+    fn argv_session_id_covers_mark_session_root() {
+        // 票 18：mark 会话根 uid 4210 → environ EACCES（marker None）；argv
+        // `--session-id` 键兜底 → 会话目录在会话存活期不算 orphan，list 可见。
+        let helper = crate::mark::helper_path();
+        let procs = vec![facts(
+            700,
+            None,
+            &[
+                helper.to_str().unwrap(),
+                "--session-id",
+                "marksg-1",
+                "--",
+                "claude",
+            ],
+            None,
+        )];
+        let r = sweep_from(&procs, &["marksg-1".to_string()]);
+        assert!(r.gateways.is_empty(), "{r:?}");
+        assert!(r.dirs.is_empty(), "活跃 mark 会话目录不得报 orphan：{r:?}");
     }
 }

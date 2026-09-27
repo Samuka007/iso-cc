@@ -5,6 +5,7 @@ mod execstub;
 mod gc;
 mod list;
 mod manifest;
+mod mark;
 mod netcfg;
 mod ns;
 mod plan;
@@ -231,7 +232,7 @@ fn cmd_run(
     // egress 预检（工单 16 两形态）：`if:` → #12 撞名拒绝 + #3 sysfs UP；
     // `socks5://` → #B proxy 可达 + 宿主默认路由接口 #3。R8 绝不回落。
     // --print-plan 同样断言：计划必须可按所印执行。
-    let _ = session::egress_preflight(&prof)?;
+    let _ = session::egress_preflight(&name, &prof)?;
     let plan = plan::plan_lines(&name, &prof, command.first());
     if print_plan || command.is_empty() {
         for l in plan {

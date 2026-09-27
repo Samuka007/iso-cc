@@ -5,6 +5,7 @@ version = 1
 
 [profile.sg]
 egress = "if:wg0"                # 只引用，不管理（D4：隧道侧负责接口存在且有路由）
+net.engine = "netns"             # netns（默认，pasta+netns）| mark（uid 策略路由，零 netns，票 18）
 locale.tz = "Asia/Singapore"
 locale.lang = "en_SG.UTF-8"      # 未生成本地 locale 时回退 C.UTF-8（doctor 警告）
 net.scope = "tree"               # tree（整树进 netns）| self（cc 本体 netns + bash RPC 转发宿主）
@@ -16,3 +17,13 @@ agent.command = "claude"         # 宿主管理的 cc 入口（D3）
 
 [profile.sg.env]
 # HISTFILE = "/tmp/iso-cc-hist"
+
+# mark 引擎（票 18）：会话零 netns，整树 uid=4210 → ip rule uidrange → 表 5182 →
+# egress 接口（须为隧道 TUN 设备，如 mihomo `tun.enable, auto-route: false`）。
+# egress 只接受 `if:` 形态；socks5/redirect/net.* netns 轴在 mark 下声明性拒绝。
+# setup 输出 rootful 步骤（setcap 助手 / chown backing / ip rule+route），
+# 逐条审计后应用；doctor 断言路由面三元组 + 助手 capability。
+# [profile.sgmark]
+# egress = "if:mihomo-tun"
+# net.engine = "mark"
+# locale.tz = "Asia/Singapore"

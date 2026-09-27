@@ -118,7 +118,9 @@ mod tests {
 
     #[test]
     fn argv0_basename_discriminates() {
-        assert!(is_stub_invocation(Some("/x/.local/state/iso-cc/sessions/s1/bin/bash".as_ref())));
+        assert!(is_stub_invocation(Some(
+            "/x/.local/state/iso-cc/sessions/s1/bin/bash".as_ref()
+        )));
         assert!(is_stub_invocation(Some("/x/shims/bash".as_ref())));
         assert!(is_stub_invocation(Some("/usr/bin/bash".as_ref())));
         assert!(!is_stub_invocation(Some("/x/target/debug/iso-cc".as_ref())));
@@ -132,7 +134,10 @@ mod tests {
         // flag 前置（-l login shell 类）：取最后一个 -c
         assert_eq!(parse_script(&os(&["-l", "-c", "true"])).unwrap(), "true");
         assert!(parse_script(&os(&["-c"])).is_err(), "-c 后无脚本 = Err");
-        assert!(parse_script(&os(&["-c", "a", "b"])).is_err(), "-c 后多参 = Err");
+        assert!(
+            parse_script(&os(&["-c", "a", "b"])).is_err(),
+            "-c 后多参 = Err"
+        );
     }
 
     #[test]
@@ -149,6 +154,9 @@ mod tests {
     #[test]
     fn parse_unrecognized_shape_rejected() {
         assert!(parse_script(&os(&[])).is_err(), "零参数 = Err（126）");
-        assert!(parse_script(&os(&["a", "b"])).is_err(), "双裸参数非任何已知形态");
+        assert!(
+            parse_script(&os(&["a", "b"])).is_err(),
+            "双裸参数非任何已知形态"
+        );
     }
 }

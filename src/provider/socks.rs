@@ -70,9 +70,7 @@ pub fn host_preflight(host: &str, port: u16) -> anyhow::Result<()> {
             Err(e) => last = format!("{a}: {e}"),
         }
     }
-    anyhow::bail!(
-        "#B socks proxy {host}:{port} 不可达（{last}）；R8：绝不回落——检查宿主代理服务"
-    );
+    anyhow::bail!("#B socks proxy {host}:{port} 不可达（{last}）；R8：绝不回落——检查宿主代理服务");
 }
 
 /// 纯函数（可单测）：SOCKS5 CONNECT 请求字节（VER=5 CMD=1 RSV=0 ATYP=3 域名）。
@@ -123,7 +121,12 @@ pub fn http_get_via_socks5(
     Err(last)
 }
 
-fn dialogue(s: &mut TcpStream, dst_host: &str, dst_port: u16, path: &str) -> Result<String, String> {
+fn dialogue(
+    s: &mut TcpStream,
+    dst_host: &str,
+    dst_port: u16,
+    path: &str,
+) -> Result<String, String> {
     s.write_all(&[0x05, 0x01, 0x00])
         .map_err(|e| format!("greeting 写失败: {e}"))?;
     let mut reply = [0u8; 2];
@@ -169,7 +172,10 @@ fn dialogue(s: &mut TcpStream, dst_host: &str, dst_port: u16, path: &str) -> Res
                 Err(format!("HTTP 非 200：{status}"))
             }
         }
-        None => Err(format!("HTTP 响应无头部分隔（前 120B）：{}", &text[..text.len().min(120)])),
+        None => Err(format!(
+            "HTTP 响应无头部分隔（前 120B）：{}",
+            &text[..text.len().min(120)]
+        )),
     }
 }
 
@@ -180,7 +186,10 @@ mod tests {
     #[test]
     fn worker_args_are_proven_form() {
         let args = worker_args(Ipv4Addr::new(172, 27, 0, 1), 7891);
-        let joined: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(
             joined,
             vec![

@@ -7,6 +7,13 @@ use std::{fs, io};
 /// 网关 DNS 转发地址默认值（pasta `--dns-forward` 与 slirp4netns 内建转发器同址）。
 pub const DEFAULT_DNS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
 
+/// mark 引擎固定面（票 18 阶段 A proven 形态）：uid 4210（编译期钉进助手）、
+/// 策略表 5182、规则 pref 15000。固定 = 单一 proven 常量面，doctor/plan/setup/
+/// session/gc 共用；参数化 = 后续票声明化，不在本票扩轴。
+pub const MARK_UID: u32 = 4210;
+pub const MARK_TABLE: u32 = 5182;
+pub const MARK_RULE_PREF: u32 = 15000;
+
 /// 网关形态（设计稿 §1）：`pasta` spawn 模式会话根（默认）| `slirp4netns` 回退（attach + selfmap）。
 /// 未知取值 = 配置错误（serde unknown variant，fail-loud #1）。
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -28,6 +35,26 @@ impl NetGateway {
 impl std::fmt::Display for NetGateway {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.bin_name())
+    }
+}
+
+/// 会话引擎（spec 变更（五）双候选并存，票 18）：
+/// - `netns`（默认）：pasta spawn + tun2socks；结构性 fail-closed、端口空间隔离；
+/// - `mark`：uid 策略路由（零 netns，localhost 双向零摩擦）；原语持久面由
+///   清单 + doctor + gc 管理（setup-manifested，spec 变更（一）两级模型）。
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Engine {
+    Netns,
+    Mark,
+}
+
+impl std::fmt::Display for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Engine::Netns => write!(f, "netns"),
+            Engine::Mark => write!(f, "mark"),
+        }
     }
 }
 
@@ -147,6 +174,9 @@ pub struct Locale {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Net {
+    /// `netns`（默认）| `mark`（票 18）：会话引擎轴（身份/隔离机制择型）。
+    #[serde(default)]
+    pub engine: Option<Engine>,
     /// `tree`（默认，整树进 netns）| `self`（cc 本体 netns + bash RPC 转发宿主）。
     #[serde(default)]
     pub scope: Option<NetScope>,
@@ -269,6 +299,11 @@ impl Profile {
         self.net.scope.unwrap_or(NetScope::Tree)
     }
 
+    /// 生效引擎（未声明 = netns，行为与票 18 之前等价）。
+    pub fn engine(&self) -> Engine {
+        self.net.engine.unwrap_or(Engine::Netns)
+    }
+
     /// 生效 bash 执行位置（未声明 = sandbox，行为与现状等价）。
     pub fn exec_bash(&self) -> ExecBash {
         self.exec.bash.unwrap_or(ExecBash::Sandbox)
@@ -307,6 +342,58 @@ impl Profile {
                 "socks5 egress 仅支持 net.gateway=pasta（slirp 回退组合未经工单 16 实测，fail-loud 拒绝落地）"
                     .to_string(),
             );
+        }
+        // mark 引擎声明性拒绝（票 18：provider/* 语义不变；netns 机制字段在
+        // mark 下不适用 = fail-loud，绝不静默忽略）。
+        if self.engine() == Engine::Mark {
+            if matches!(self.egress(), Ok(Egress::Socks5 { .. })) {
+                errs.push(
+                    "mark 引擎不适用 socks5 egress（零 netns：无 tun2proxy 承载面）——将 mihomo TUN 化后用 egress=if:<tun 设备>（票 18）"
+                        .to_string(),
+                );
+            }
+            if !self.redirect.is_empty() {
+                errs.push(
+                    "mark 引擎零 mountns：redirect 挂载面不适用（bind 无处落地，声明性拒绝；票 18）"
+                        .to_string(),
+                );
+            }
+            if self.net.scope.is_some() {
+                errs.push(
+                    "net.scope 是 netns 身份轴；mark 引擎身份 = uid（整树同 uid），轴不适用（票 18）"
+                        .to_string(),
+                );
+            }
+            if self.net.ipv6.is_some() {
+                errs.push(
+                    "net.ipv6 是 netns 轴；mark 引擎 v6 恒 fail-closed（表内 unreachable），不可声明（票 18）"
+                        .to_string(),
+                );
+            }
+            if !self.net.localhost_forward.is_empty() {
+                errs.push(
+                    "net.localhost_forward 是 netns 转发面；mark 引擎 localhost 双向零摩擦（结构成立），轴不适用（票 18）"
+                        .to_string(),
+                );
+            }
+            if self.net.private.is_some() {
+                errs.push(
+                    "net.private 是 netns 路由策略轴；mark 引擎不适用（uidrange 表内无 RFC1918 策略面，票 18）"
+                        .to_string(),
+                );
+            }
+            if self.net.gateway.is_some() {
+                errs.push(
+                    "net.gateway 是 netns 网关形态轴；mark 引擎会话根 = file-cap 助手（无网关进程），轴不适用（票 18）"
+                        .to_string(),
+                );
+            }
+            if self.net.dns.is_some() {
+                errs.push(
+                    "net.dns 是 netns DNS 转发地址；mark 引擎 DNS 元数据走宿主解析器（票 18 已登记例外，resolv bind 无 mountns 承载），轴不适用"
+                        .to_string(),
+                );
+            }
         }
         for r in &self.redirect {
             if !r.contains('=') || r.split('=').count() != 2 {
@@ -527,10 +614,22 @@ agent.command = "claude"
             ))
             .unwrap();
             let p = cfg.profile.get("x").unwrap();
-            assert_eq!(p.exec_bash(), if bash == "host" { ExecBash::Host } else { ExecBash::Sandbox }, "{scope}+{bash}");
+            assert_eq!(
+                p.exec_bash(),
+                if bash == "host" {
+                    ExecBash::Host
+                } else {
+                    ExecBash::Sandbox
+                },
+                "{scope}+{bash}"
+            );
             assert_eq!(
                 p.scope(),
-                if scope == "self" { NetScope::Self_ } else { NetScope::Tree },
+                if scope == "self" {
+                    NetScope::Self_
+                } else {
+                    NetScope::Tree
+                },
                 "{scope}+{bash}"
             );
         }
@@ -597,14 +696,23 @@ agent.command = "claude"
         assert_eq!(pairs.len(), 3);
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
         let base = crate::manifest::state_dir().join("profiles").join("ccx");
-        assert_eq!(pairs[0].view, std::path::PathBuf::from(&home).join(".claude"));
+        assert_eq!(
+            pairs[0].view,
+            std::path::PathBuf::from(&home).join(".claude")
+        );
         assert_eq!(pairs[0].backing, base.join("claude"));
         assert!(pairs[0].backing_is_dir);
         assert_eq!(pairs[0].key, "claude");
-        assert_eq!(pairs[1].view, std::path::PathBuf::from(&home).join(".claude.json"));
+        assert_eq!(
+            pairs[1].view,
+            std::path::PathBuf::from(&home).join(".claude.json")
+        );
         assert_eq!(pairs[1].backing, base.join("claude.json"));
         assert!(!pairs[1].backing_is_dir);
-        assert_eq!(pairs[2].view, std::path::PathBuf::from(&home).join(".claude.json.backup"));
+        assert_eq!(
+            pairs[2].view,
+            std::path::PathBuf::from(&home).join(".claude.json.backup")
+        );
         assert_eq!(pairs[2].backing, base.join("claude.json.backup"));
         assert!(!pairs[2].backing_is_dir);
     }
@@ -646,8 +754,7 @@ agent.command = "claude"
         .unwrap();
         let errs = cfg.profile.get("x").unwrap().validate();
         assert!(
-            errs.iter()
-                .any(|e| e.contains("仅支持 net.gateway=pasta")),
+            errs.iter().any(|e| e.contains("仅支持 net.gateway=pasta")),
             "{errs:?}"
         );
     }
@@ -668,14 +775,14 @@ agent.command = "claude"
     #[test]
     fn socks5_malformed_urls_rejected() {
         for bad in [
-            "socks5://",             // 空
-            "socks5://host",         // 缺端口
-            "socks5://host:port",    // 端口非数字
-            "socks5://host:99999",   // 端口越界
-            "socks5://:7891",        // 空 host
-            "socks5://user@host:1",  // userinfo v1 不支持（凭据不静默丢弃）
-            "socks5://::1:7891",     // 裸 v6（二义）必须括号形态
-            "socks5://[::1]",        // 括号缺端口
+            "socks5://",            // 空
+            "socks5://host",        // 缺端口
+            "socks5://host:port",   // 端口非数字
+            "socks5://host:99999",  // 端口越界
+            "socks5://:7891",       // 空 host
+            "socks5://user@host:1", // userinfo v1 不支持（凭据不静默丢弃）
+            "socks5://::1:7891",    // 裸 v6（二义）必须括号形态
+            "socks5://[::1]",       // 括号缺端口
         ] {
             let cfg: Config =
                 toml::from_str(&format!("version = 1\n[profile.x]\negress = {bad:?}")).unwrap();
@@ -713,5 +820,52 @@ agent.command = "claude"
         assert!(resolve_profile(&cfg, Some("nope")).is_err());
         let (name, _) = resolve_profile(&cfg, None).unwrap();
         assert_eq!(name, "sg");
+    }
+
+    #[test]
+    fn engine_defaults_to_netns() {
+        // 未声明 = netns（票 18 之前的行为等价）；netns 配置面零回归
+        let p: Profile = toml::from_str("egress = 'if:wg0'").unwrap();
+        assert_eq!(p.engine(), Engine::Netns);
+        assert!(p.validate().is_empty());
+    }
+
+    #[test]
+    fn engine_mark_parses_and_netns_full_profile_unaffected() {
+        let p: Profile = toml::from_str(
+            "egress = 'if:mihomo-tun'\nnet.engine = 'mark'\nlocale.tz = 'Asia/Singapore'",
+        )
+        .unwrap();
+        assert_eq!(p.engine(), Engine::Mark);
+        assert!(p.validate().is_empty(), "{:?}", p.validate());
+    }
+
+    #[test]
+    fn engine_unknown_value_rejected() {
+        let err = toml::from_str::<Profile>("egress = 'if:w'\nnet.engine = 'bogus'");
+        assert!(err.is_err(), "未知 engine 必须拒绝（fail-loud 同 gateway）");
+    }
+
+    #[test]
+    fn mark_rejects_netns_only_declaratively() {
+        let cases = [
+            "egress = 'socks5://127.0.0.1:7891'".to_string(),
+            "egress = 'if:w'\nredirect = ['/a=/b']".to_string(),
+            "egress = 'if:w'\nnet.scope = 'tree'".to_string(),
+            "egress = 'if:w'\nnet.ipv6 = 'off'".to_string(),
+            "egress = 'if:w'\nnet.localhost_forward = [5432]".to_string(),
+            "egress = 'if:w'\nnet.private = 'host'".to_string(),
+            "egress = 'if:w'\nnet.gateway = 'pasta'".to_string(),
+            "egress = 'if:w'\nnet.dns = '10.0.2.3'".to_string(),
+        ];
+        for body in cases {
+            let p: Profile = toml::from_str(&format!("{body}\nnet.engine = 'mark'")).unwrap();
+            let errs = p.validate();
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("mark 引擎") || e.contains("票 18") || e.contains("mark")),
+                "{body} 在 mark 下应被声明性拒绝：{errs:?}"
+            );
+        }
     }
 }

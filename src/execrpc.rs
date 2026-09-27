@@ -19,21 +19,19 @@
 use crate::config::Profile;
 use crate::ns;
 use anyhow::Context as _;
-use std::os::unix::process::ExitStatusExt as _;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use nix::sys::socket::{
-    recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags, UnixAddr,
-};
+use nix::sys::socket::{recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags, UnixAddr};
 /// 宿主侧执行体（票 15 spec#1 正本措辞：`/bin/bash -c`）。
 const HOST_SHELL: &str = "/bin/bash";
 
@@ -155,32 +153,50 @@ pub struct ExecServer {
 
 /// 装配（fallible，须在网关 spawn 前完成——env 注入需要 shell/sock 路径）：
 /// ① `<sess>/bin/bash` 符号链接 → iso-cc 自身（附 2：bind 上去的是 iso-cc 自身，
-/// argv0 basename 判别；无独立 shim 文件）；② bind `exec.sock` + 0600（附⑦：
-/// 同 uid 任意宿主执行面的最小暴露面）。
+/// argv0 basename 判别；无独立 shim 文件）；② bind `exec.sock`：0600（netns，
+/// 附⑦：同 uid 任意宿主执行面的最小暴露面）| 0666（mark，票 18：会话树 uid 4210
+/// 对宿主 0600 sock connect EACCES——文件位让位于 accept 期 SO_PEERCRED 凭证
+/// 白名单（[`peer_allowed_for`]），强制力不降反升）。
 pub fn prepare(
     sess_dir: &Path,
     profile: &Profile,
     session_id: &str,
+    cross_uid: bool,
 ) -> anyhow::Result<ExecChannel> {
     let exe = std::env::current_exe().context("current_exe 不可用")?;
     let bin_dir = sess_dir.join("bin");
     std::fs::create_dir_all(&bin_dir)
         .with_context(|| format!("创建 L2 shim 目录 {}", bin_dir.display()))?;
     let shell_path = bin_dir.join("bash");
-    std::os::unix::fs::symlink(&exe, &shell_path).with_context(|| {
-        format!(
-            "创建 multi-call shim 符号链接 {} -> {}",
-            shell_path.display(),
-            exe.display()
-        )
-    })?;
+    if cross_uid {
+        // mark（票 18）：uid 4210 对宿主 $HOME 链路不可达（0700 实测）——symlink
+        // 解析路径必须可 traverse——shim 指向 mark 根的供给二进制（内容 diff
+        // 供给，幂等；会话作用域：symlink 随 sess_dir 在 Session::wait 回收）。
+        let shim_bin = crate::mark::ensure_shim_binary()?;
+        std::os::unix::fs::symlink(&shim_bin, &shell_path).with_context(|| {
+            format!(
+                "创建 multi-call shim 符号链接 {} -> {}",
+                shell_path.display(),
+                shim_bin.display()
+            )
+        })?;
+    } else {
+        std::os::unix::fs::symlink(&exe, &shell_path).with_context(|| {
+            format!(
+                "创建 multi-call shim 符号链接 {} -> {}",
+                shell_path.display(),
+                exe.display()
+            )
+        })?;
+    }
     let sock_path = sess_dir.join("exec.sock");
     // 防御性清理（同 id 重跑不发生——id 含纳秒；崩溃残留交 13 sweep）。
     let _ = std::fs::remove_file(&sock_path);
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("bind exec.sock {}", sock_path.display()))?;
-    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", sock_path.display()))?;
+    let sock_mode = if cross_uid { 0o666 } else { 0o600 };
+    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(sock_mode))
+        .with_context(|| format!("chmod {sock_mode:o} {}", sock_path.display()))?;
     let vars = Arc::new(worker_env_vars(profile, session_id));
     Ok(ExecChannel {
         shell_path,
@@ -189,6 +205,14 @@ pub fn prepare(
         listener,
         spec: Arc::new(WorkerSpec { vars }),
     })
+}
+
+/// 对端凭证白名单（纯函数，可单测）：宿主 iso-cc 自身（shutdown dummy-connect +
+/// netns 树经 pasta/slirp 映射后的对端 uid = 宿主发起者）∪ mark uid（票 18：
+/// 会话树 uid 4210 的 shim → exec.sock）。其余本地用户一律拒绝（强制点在
+/// accept 期，文件位只是第一道）。
+fn peer_allowed_for(peer_uid: u32, euid: u32) -> bool {
+    peer_uid == euid || peer_uid == crate::config::MARK_UID
 }
 
 impl ExecChannel {
@@ -251,6 +275,16 @@ impl ExecServer {
 /// 单连接处理：收 fd + 请求 → 宿主侧 fork `/bin/bash -c`（dup2 接管 stdio）→
 /// waiter（wait + 回传状态）+ watcher（EOF/中断 → SIGKILL）双线程。
 fn handle_conn(mut stream: UnixStream, spec: Arc<WorkerSpec>, registry: Arc<Mutex<Vec<u32>>>) {
+    // accept 期凭证白名单（票 18）：0666 文件位下任何本地用户可 connect，
+    // 非白名单 uid 在此被拒（无执行面；0666 仅 mark 引擎会话树需要）。
+    let peer_uid =
+        nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)
+            .map(|c| c.uid())
+            .unwrap_or(u32::MAX);
+    if !peer_allowed_for(peer_uid, unsafe { libc::geteuid() }) {
+        eprintln!("[iso-cc] exec-rpc: 对端 uid={peer_uid} 不在白名单（宿主发起者/mark uid）——拒绝");
+        return;
+    }
     let (fds, req) = match recv_request(&mut stream) {
         Ok(x) => x,
         Err(e) => {
@@ -380,10 +414,7 @@ fn recv_request(stream: &mut UnixStream) -> io::Result<([OwnedFd; 3], ExecReques
     if fds.len() != 3 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "SCM_RIGHTS 数量异常：{}（期望 3 = stdio 三 fd）",
-                fds.len()
-            ),
+            format!("SCM_RIGHTS 数量异常：{}（期望 3 = stdio 三 fd）", fds.len()),
         ));
     }
     // 长度前缀可能被截在首条消息之后（iov 上限 4B），补齐。
@@ -391,10 +422,7 @@ fn recv_request(stream: &mut UnixStream) -> io::Result<([OwnedFd; 3], ExecReques
     while got < 4 {
         let n = stream.read(&mut len_buf[got..])?;
         if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "长度前缀残缺",
-            ));
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "长度前缀残缺"));
         }
         got += n;
     }
@@ -410,9 +438,7 @@ fn recv_request(stream: &mut UnixStream) -> io::Result<([OwnedFd; 3], ExecReques
     let req: ExecRequest =
         serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     // Vec<OwnedFd> → [OwnedFd; 3]（保序：stdin, stdout, stderr）。
-    let arr: [OwnedFd; 3] = fds
-        .try_into()
-        .expect("长度已在上方断言为 3");
+    let arr: [OwnedFd; 3] = fds.try_into().expect("长度已在上方断言为 3");
     Ok((arr, req))
 }
 
@@ -461,7 +487,12 @@ mod tests {
         let s: ExecResponse = serde_json::from_str(r#"{"status":"signal","signal":2}"#).unwrap();
         assert_eq!(s, ExecResponse::Signal { signal: 2 });
         let e: ExecResponse = serde_json::from_str(r#"{"status":"error","error":"boom"}"#).unwrap();
-        assert_eq!(e, ExecResponse::Error { error: "boom".into() });
+        assert_eq!(
+            e,
+            ExecResponse::Error {
+                error: "boom".into()
+            }
+        );
         assert!(
             serde_json::from_str::<ExecResponse>(r#"{"status":"code","code":7,"signal":2}"#)
                 .is_err(),
@@ -483,7 +514,11 @@ mod tests {
         assert_eq!(vars.get("LANG").unwrap(), "en_SG.UTF-8");
         assert_eq!(vars.get("LC_ALL").unwrap(), "en_SG.UTF-8");
         assert_eq!(vars.get("HISTFILE").unwrap(), "/tmp/h");
-        assert_eq!(vars.get("ISO_CC_SESSION").unwrap(), "sg-1", "spec#4 会话标记");
+        assert_eq!(
+            vars.get("ISO_CC_SESSION").unwrap(),
+            "sg-1",
+            "spec#4 会话标记"
+        );
         assert_eq!(vars.len(), 5);
         // 无 locale 声明 = 仅会话标记
         let p2 = prof("egress='if:wg0'");
@@ -500,7 +535,7 @@ mod tests {
     fn channel_roundtrip_stdio_env_and_exit_code() {
         let dir = tempfile::tempdir().unwrap();
         let p = prof("egress='if:wg0'\nlocale.tz='Asia/Singapore'");
-        let ch = prepare(dir.path(), &p, "t-chan").expect("prepare");
+        let ch = prepare(dir.path(), &p, "t-chan", false).expect("prepare");
         let server = ch.serve();
         let sock_path = dir.path().join("exec.sock");
 
@@ -563,12 +598,16 @@ mod tests {
     fn peer_eof_interrupts_worker() {
         let dir = tempfile::tempdir().unwrap();
         let p = prof("egress='if:wg0'");
-        let ch = prepare(dir.path(), &p, "t-intr").expect("prepare");
+        let ch = prepare(dir.path(), &p, "t-intr", false).expect("prepare");
         let server = ch.serve();
         let sock_path = dir.path().join("exec.sock");
 
         let devnull = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
-        let fds = [devnull.as_raw_fd(), devnull.as_raw_fd(), devnull.as_raw_fd()];
+        let fds = [
+            devnull.as_raw_fd(),
+            devnull.as_raw_fd(),
+            devnull.as_raw_fd(),
+        ];
         let req = ExecRequest {
             script: "sleep 30".into(),
             cwd: dir.path().to_string_lossy().into_owned(),
@@ -599,5 +638,37 @@ mod tests {
         }
         assert!(gone, "对端断开后 worker pid={pid} 未被中断转发击杀");
         server.shutdown();
+    }
+
+    #[test]
+    fn peer_allowlist_covers_euid_and_mark_uid_only() {
+        let euid = unsafe { libc::geteuid() };
+        assert!(peer_allowed_for(euid, euid), "宿主自身/shutdown 必须放行");
+        assert!(
+            peer_allowed_for(crate::config::MARK_UID, euid),
+            "mark 会话树 uid 必须放行（票 18）"
+        );
+        if crate::config::MARK_UID != euid {
+            assert!(!peer_allowed_for(euid + 7, euid), "任意本地 uid 必须拒绝");
+        }
+    }
+
+    #[test]
+    fn prepare_socket_mode_follows_cross_uid_axis() {
+        // netns（cross_uid=false）= 0600（附⑦ 语义不变）；mark = 0666 +
+        // accept 期凭证白名单强制（peer_allowlist 测试为强制核）。
+        let p = prof("egress='if:wg0'");
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let ch = prepare(dir.path(), &p, "t-mode-netns", false).expect("prepare netns");
+            let md = std::fs::metadata(&ch.sock_path).unwrap();
+            assert_eq!(md.permissions().mode() & 0o777, 0o600);
+        }
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let ch = prepare(dir.path(), &p, "t-mode-mark", true).expect("prepare mark");
+            let md = std::fs::metadata(&ch.sock_path).unwrap();
+            assert_eq!(md.permissions().mode() & 0o777, 0o666);
+        }
     }
 }

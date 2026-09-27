@@ -217,10 +217,7 @@ pub fn wait_tun_ready(iface: &str, timeout: Duration) -> io::Result<()> {
                 |msg| {
                     if let RouteNetlinkMessage::NewRoute(route) = msg {
                         if route.header.address_family == AddressFamily::Inet
-                            && matches!(
-                                route.header.destination_prefix_length,
-                                0 | 1
-                            )
+                            && matches!(route.header.destination_prefix_length, 0 | 1)
                             && route
                                 .attributes
                                 .iter()
@@ -261,7 +258,11 @@ fn gateway_of(route: &RouteMessage, oif: u32) -> Option<Ipv4Addr> {
             _ => {}
         }
     }
-    if oif_ok { gw.copied() } else { None }
+    if oif_ok {
+        gw.copied()
+    } else {
+        None
+    }
 }
 
 /// 发送一个 dump 请求（REQUEST|DUMP）并收取回复直至 NLMSG_DONE。
@@ -285,18 +286,22 @@ where
         let mut offset = 0usize;
         let mut done = false;
         while offset < data.len() {
-            let msg = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&data[offset..])
-                .map_err(|e| {
+            let msg = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&data[offset..]).map_err(
+                |e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("netlink 消息解析失败（offset={offset}）: {e}"),
                     )
-                })?;
+                },
+            )?;
             let len = msg.header.length as usize;
             if len < NETLINK_HEADER_LEN || offset + len > data.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("netlink 消息长度畸形（len={len}, offset={offset}, 报文={}B）", data.len()),
+                    format!(
+                        "netlink 消息长度畸形（len={len}, offset={offset}, 报文={}B）",
+                        data.len()
+                    ),
                 ));
             }
             offset += len;
@@ -351,7 +356,10 @@ mod tests {
         let err = disable_ipv6_via(&["/proc/iso-cc-nonexistent/disable_ipv6"]).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("#7"), "{msg}");
-        assert!(msg.contains("/proc/iso-cc-nonexistent/disable_ipv6"), "{msg}");
+        assert!(
+            msg.contains("/proc/iso-cc-nonexistent/disable_ipv6"),
+            "{msg}"
+        );
         assert!(msg.contains("os error"), "{msg}");
     }
 

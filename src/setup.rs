@@ -9,7 +9,7 @@
 //!
 //! run 期契约随本命令切换（cutover）：会话过程零持久物，挂载点缺失 = fail-loud。
 
-use crate::config::Profile;
+use crate::config::{Engine, Profile};
 use crate::manifest::{self, Entry, EntryKind, Manifest};
 use anyhow::{anyhow, Context};
 use std::path::Path;
@@ -17,9 +17,15 @@ use std::path::Path;
 /// provider 条目登记理由（指名 R/ADR）。
 const REASON_PROVIDER: &str = "R11/D7 provider 钉路径（票 14 清单态，替换 09 期 which 过渡）";
 /// mountpoint 条目登记理由（N3 例外①移至 setup 期）。
-const REASON_MOUNTPOINT: &str = "N3 例外① setup 期创建并登记（spec 变更（一）setup-manifested，票 14）";
+const REASON_MOUNTPOINT: &str =
+    "N3 例外① setup 期创建并登记（spec 变更（一）setup-manifested，票 14）";
 /// profile-state 条目登记理由（票 05：CC profile 持久态，gc 仅随显式 --profile）。
 const REASON_PROFILE_STATE: &str = "R4/D6 CC profile 持久态（票 05；gc 仅随显式 --profile 回收）";
+/// cap-bin 条目登记理由（票 18：持久 capability 助手 = setup-manifested）。
+const REASON_CAP_BIN: &str =
+    "票 18 mark 引擎 file-cap 助手（setuid 编译期 uid；doctor getcap 断言；gc 实删）";
+/// route-rule 条目登记理由（票 18：uid 策略路由面，rootful 应用 + doctor 三元组断言）。
+const REASON_ROUTE_RULE: &str = "票 18 mark 引擎策略路由面（pref 15000 uidrange → 表 5182 + unreachable 兜底 + v6 镜像；gc 打印回滚命令）";
 
 /// 单条收敛动作（人类可读行 + `--json` 数组元素共用）。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -55,81 +61,144 @@ fn create_mountpoint(src: &Path, dst: &Path) -> anyhow::Result<&'static str> {
 pub fn converge(profile_name: &str, profile: &Profile) -> anyhow::Result<(Vec<Action>, usize)> {
     let mut manifest = manifest::read()?.unwrap_or_else(Manifest::empty);
     let mut actions: Vec<Action> = Vec::new();
+    let mark = profile.engine() == Engine::Mark;
 
     // ① provider 收敛：which + --version → 绝对路径+版本 upsert（仅事实变化时——
     //    registered_at 是 mountpoint 守卫基准，provider 无此依赖，但幂等要求 diff=0）。
     //    socks5 形态（工单 16）额外收敛 tun2proxy worker（清单 key 与 bin 名解耦）。
-    let mut wanted: Vec<(&str, Vec<&str>)> = vec![(profile.gateway().bin_name(), vec![profile.gateway().bin_name()])];
-    if matches!(profile.egress(), Ok(crate::config::Egress::Socks5 { .. })) {
-        wanted.push((crate::provider::socks::WORKER_KEY, crate::provider::socks::BIN_CANDIDATES.to_vec()));
-    }
-    for (key, candidates) in wanted {
-        let path = crate::provider::which_any(&candidates).ok_or_else(|| {
+    //    mark 引擎（票 18）：无网关进程/worker（会话根 = file-cap 助手），整节跳过。
+    if !mark {
+        let mut wanted: Vec<(&str, Vec<&str>)> = vec![(
+            profile.gateway().bin_name(),
+            vec![profile.gateway().bin_name()],
+        )];
+        if matches!(profile.egress(), Ok(crate::config::Egress::Socks5 { .. })) {
+            wanted.push((
+                crate::provider::socks::WORKER_KEY,
+                crate::provider::socks::BIN_CANDIDATES.to_vec(),
+            ));
+        }
+        for (key, candidates) in wanted {
+            let path = crate::provider::which_any(&candidates).ok_or_else(|| {
             anyhow!(
                 "setup：provider {key} 不在 PATH（egress={}）；缺失报包名：passt / slirp4netns / nixpkgs#tun2proxy 或上游静态单文件——setup 不代装",
                 profile.egress
             )
         })?;
-        let version = crate::provider::version_output(&path)?;
-        let changed = manifest
-            .find(EntryKind::Provider, key)
-            .is_none_or(|e| e.path.as_deref() != Some(path.as_path()) || e.version.as_deref() != Some(version.as_str()));
-        if changed {
-            manifest.upsert(Entry {
-                kind: EntryKind::Provider,
-                key: key.to_string(),
-                path: Some(path.clone()),
-                version: Some(version.clone()),
-                registered_at: manifest::now_millis(),
-                reason: REASON_PROVIDER.into(),
+            let version = crate::provider::version_output(&path)?;
+            let changed = manifest.find(EntryKind::Provider, key).is_none_or(|e| {
+                e.path.as_deref() != Some(path.as_path())
+                    || e.version.as_deref() != Some(version.as_str())
             });
+            if changed {
+                manifest.upsert(Entry {
+                    kind: EntryKind::Provider,
+                    key: key.to_string(),
+                    path: Some(path.clone()),
+                    version: Some(version.clone()),
+                    registered_at: manifest::now_millis(),
+                    reason: REASON_PROVIDER.into(),
+                });
+                actions.push(Action {
+                    target: format!("provider {key}"),
+                    detail: format!("{}（{version}）", path.display()),
+                });
+            }
+        }
+    }
+
+    // ①a mark 收敛（票 18）：助手编译（content-hash 幂等）+ cap-bin/route-rule 登记。
+    //    安装面 = rootful 步骤（run() 尾部 dry-run 输出；本工具零 sudo）。
+    if mark {
+        if crate::mark::ensure_helper()? {
             actions.push(Action {
-                target: format!("provider {key}"),
-                detail: format!("{}（{version}）", path.display()),
+                target: "cap-bin compile".into(),
+                detail: format!(
+                    "{}（uid 编译期钉定；file caps 归 rootful setcap 步骤）",
+                    crate::mark::helper_path().display()
+                ),
+            });
+        }
+        if manifest.insert_new_only(Entry {
+            kind: EntryKind::CapBin,
+            key: crate::mark::cap_bin_key(profile_name),
+            path: Some(crate::mark::helper_path()),
+            version: None,
+            registered_at: manifest::now_millis(),
+            reason: REASON_CAP_BIN.into(),
+        }) {
+            actions.push(Action {
+                target: format!("cap-bin {}", crate::mark::helper_path().display()),
+                detail: "登记（mark 助手；setcap 步骤见 rootful 块）".into(),
+            });
+        }
+        if manifest.insert_new_only(Entry {
+            kind: EntryKind::RouteRule,
+            key: crate::mark::route_rule_key(profile_name),
+            path: None,
+            version: None,
+            registered_at: manifest::now_millis(),
+            reason: REASON_ROUTE_RULE.into(),
+        }) {
+            actions.push(Action {
+                target: "route-rule".into(),
+                detail: "登记（uid 策略路由面；应用步骤见 rootful 块）".into(),
             });
         }
     }
 
     // ② 挂载点收敛：redirect 集内缺失 mkdir/touch + 登记（insert_new_only 保留原
     //    registered_at = gc 用户数据化守卫基准；已存在路径不纳管）。
-    for r in &profile.redirect {
-        let (src, dst) = r
-            .split_once('=')
-            .ok_or_else(|| anyhow!("redirect 必须是 `src=dst`：{r:?}"))?;
-        let src = Path::new(src);
-        let dst = Path::new(dst);
-        if !dst.exists() {
-            let how = create_mountpoint(src, dst)?;
-            let key = mountpoint_key(profile_name, &dst.to_string_lossy());
-            manifest.insert_new_only(Entry {
-                kind: EntryKind::Mountpoint,
-                key,
-                path: Some(dst.to_path_buf()),
-                version: None,
-                registered_at: manifest::now_millis(),
-                reason: REASON_MOUNTPOINT.into(),
-            });
-            actions.push(Action {
-                target: format!("mountpoint {}", dst.display()),
-                detail: format!("{how}（src={}）", src.display()),
-            });
+    //    mark 引擎（票 18）：零 mountns，redirect 已在 validate 声明性拒绝，整节跳过。
+    if !mark {
+        for r in &profile.redirect {
+            let (src, dst) = r
+                .split_once('=')
+                .ok_or_else(|| anyhow!("redirect 必须是 `src=dst`：{r:?}"))?;
+            let src = Path::new(src);
+            let dst = Path::new(dst);
+            if !dst.exists() {
+                let how = create_mountpoint(src, dst)?;
+                let key = mountpoint_key(profile_name, &dst.to_string_lossy());
+                manifest.insert_new_only(Entry {
+                    kind: EntryKind::Mountpoint,
+                    key,
+                    path: Some(dst.to_path_buf()),
+                    version: None,
+                    registered_at: manifest::now_millis(),
+                    reason: REASON_MOUNTPOINT.into(),
+                });
+                actions.push(Action {
+                    target: format!("mountpoint {}", dst.display()),
+                    detail: format!("{how}（src={}）", src.display()),
+                });
+            }
         }
     }
 
     // ②a CC 内置对收敛（票 05 / R4 / D6）：cc_isolation=true（默认）时——
     //    backing（profiles/<profile>/ 持久态）缺失创建 + 登记 profile-state
     //    （insert_new_only 兼作清单丢失自愈；重跑双 false → action diff=0）；
-    //    view（cc 默认路径）缺失预创建 + 登记 mountpoint（D6/N3 有界宿主痕迹；
+    //    view（cc 默认路径）缺失预创建 + 登记 mountpoint（netns：D6/N3 有界宿主痕迹；
     //    预存在路径非本工具所有，不纳管）。
+    //    mark 引擎（票 18）：隔离 = uid DAC + HOME 重写，view/mountpoint 不适用；
+    //    backing 属主归 rootful chown 步骤（run/doctor 断言 st_uid）。
     if profile.cc_isolation() {
-        for pair in crate::config::cc_builtin_pairs(profile_name) {
+        let pairs = if mark {
+            crate::mark::cc_builtin_pairs_mark(profile_name)
+        } else {
+            crate::config::cc_builtin_pairs(profile_name)
+        };
+        for pair in pairs {
             let created = if !pair.backing.exists() {
                 if pair.backing_is_dir {
-                    std::fs::create_dir_all(&pair.backing)
-                        .with_context(|| format!("创建 CC backing 目录 {}", pair.backing.display()))?;
+                    std::fs::create_dir_all(&pair.backing).with_context(|| {
+                        format!("创建 CC backing 目录 {}", pair.backing.display())
+                    })?;
                 } else {
-                    std::fs::write(&pair.backing, b"")
-                        .with_context(|| format!("创建 CC backing 文件 {}", pair.backing.display()))?;
+                    std::fs::write(&pair.backing, b"").with_context(|| {
+                        format!("创建 CC backing 文件 {}", pair.backing.display())
+                    })?;
                 }
                 true
             } else {
@@ -148,13 +217,17 @@ pub fn converge(profile_name: &str, profile: &Profile) -> anyhow::Result<(Vec<Ac
                     target: format!("profile-state {}", pair.backing.display()),
                     detail: format!(
                         "{}（cc 内置对 {key}；view={}）",
-                        if created { "mkdir/touch" } else { "登记（清单自愈）" },
+                        if created {
+                            "mkdir/touch"
+                        } else {
+                            "登记（清单自愈）"
+                        },
                         pair.view.display(),
                         key = pair.key
                     ),
                 });
             }
-            if !pair.view.exists() {
+            if !mark && !pair.view.exists() {
                 let how = create_mountpoint(&pair.backing, &pair.view)?;
                 manifest.insert_new_only(Entry {
                     kind: EntryKind::Mountpoint,
@@ -184,6 +257,19 @@ pub fn converge(profile_name: &str, profile: &Profile) -> anyhow::Result<(Vec<Ac
 /// `iso-cc setup` 入口：收敛 + 报告（action diff = 动作数；幂等重跑 = 0）。
 pub fn run(profile_name: &str, profile: &Profile, json: bool) -> anyhow::Result<()> {
     let (actions, entries) = converge(profile_name, profile)?;
+    // mark 引擎（票 18）：rootful 安装面 = 命令构建 + dry-run 输出（本工具永不
+    // sudo——rootful 只出现在「用户逐条审计应用」的声明阶段，spec 变更（一））。
+    // 幂等语义：manifest action diff 重跑 = 0；rootful 块 = 审计输出，每次恒印
+    // （内容确定性：同一 config 推导同一命令序列；replace/del-add 形态可安全重放）。
+    let rootful = if profile.engine() == Engine::Mark {
+        Some(crate::mark::rootful_steps(
+            profile_name,
+            profile.egress_iface()?,
+            profile.cc_isolation(),
+        ))
+    } else {
+        None
+    };
     if json {
         println!(
             "{}",
@@ -192,6 +278,7 @@ pub fn run(profile_name: &str, profile: &Profile, json: bool) -> anyhow::Result<
                 "actions": actions,
                 "action_count": actions.len(),
                 "entries": entries,
+                "rootful_steps": rootful.unwrap_or_default(),
             }))?
         );
     } else {
@@ -202,6 +289,17 @@ pub fn run(profile_name: &str, profile: &Profile, json: bool) -> anyhow::Result<
             "setup[{profile_name}]: manifest 原子重建（{entries} entries）；action diff = {}",
             actions.len()
         );
+        if let Some(steps) = rootful {
+            println!(
+                "setup[{profile_name}]: —— rootful 安装面（dry-run；未执行，逐条审计后应用）——"
+            );
+            for s in steps {
+                println!("  {s}");
+            }
+            println!(
+                "setup[{profile_name}]: 应用前提：mihomo 已处 TUN 形态（tun down/up 抖动后重跑本块自愈——票 18 发现 2）"
+            );
+        }
     }
     Ok(())
 }
@@ -239,15 +337,21 @@ mod tests {
             reason: REASON_PROVIDER.into(),
         };
         m.upsert(e.clone());
-        let changed = m
-            .find(EntryKind::Provider, "pasta")
-            .is_none_or(|e| e.path.as_deref() != Some(Path::new("/x/pasta")) || e.version.as_deref() != Some("v1"));
+        let changed = m.find(EntryKind::Provider, "pasta").is_none_or(|e| {
+            e.path.as_deref() != Some(Path::new("/x/pasta")) || e.version.as_deref() != Some("v1")
+        });
         assert!(!changed, "事实未变不得产生动作（diff=0 前提）");
         m.upsert(Entry {
             version: Some("v2".into()),
             registered_at: 2,
             ..e
         });
-        assert_eq!(m.find(EntryKind::Provider, "pasta").unwrap().version.as_deref(), Some("v2"));
+        assert_eq!(
+            m.find(EntryKind::Provider, "pasta")
+                .unwrap()
+                .version
+                .as_deref(),
+            Some("v2")
+        );
     }
 }

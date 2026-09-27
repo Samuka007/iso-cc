@@ -21,10 +21,13 @@ pub struct GcOpts {
     pub profile: Option<String>,
 }
 
-/// entry 的 profile 定界（mountpoint/profile-state 的 key = `<profile>:<路径或名>`）。
+/// entry 的 profile 定界（mountpoint/profile-state/mark 资源的 key = `<profile>:<路径或名>`）。
 fn entry_profile(e: &Entry) -> Option<&str> {
     match e.kind {
-        EntryKind::Mountpoint | EntryKind::ProfileState => e.key.split_once(':').map(|(p, _)| p),
+        EntryKind::Mountpoint
+        | EntryKind::ProfileState
+        | EntryKind::CapBin
+        | EntryKind::RouteRule => e.key.split_once(':').map(|(p, _)| p),
         EntryKind::Provider => None,
     }
 }
@@ -41,7 +44,9 @@ pub fn stale_entries(entries: &[Entry], profiles: &BTreeMap<String, Profile>) ->
 /// 纯判定：活跃会话 = cc 树（bootstrap 自设标记）∪ 归属明确的网关。
 /// id="?" 的网关指纹进程 = sweep 孤儿（票 13 判定核），不是活跃会话——恰是 --all 的清理对象。
 pub fn has_active_sessions(sessions: &[list::Session]) -> bool {
-    sessions.iter().any(|s| s.kind == "cc" || (s.kind == "gateway" && s.id != "?"))
+    sessions
+        .iter()
+        .any(|s| s.kind == "cc" || (s.kind == "gateway" && s.id != "?"))
 }
 
 /// 纯判定：mountpoint 回收守卫（设计稿 §5 gc：size/mtime 变化 = 已用户数据化 → 拒绝
@@ -55,7 +60,8 @@ pub fn reclaim_decision(
     registered_at: u64,
     force: bool,
 ) -> Result<(), String> {
-    let changed = (is_dir && dir_nonempty) || (!is_dir && size != 0) || mtime_millis > registered_at;
+    let changed =
+        (is_dir && dir_nonempty) || (!is_dir && size != 0) || mtime_millis > registered_at;
     if changed && !force {
         return Err("自创建后 size/mtime 变化 = 已用户数据化（--force 可显式越过）".into());
     }
@@ -64,8 +70,7 @@ pub fn reclaim_decision(
 
 /// 现实侧事实（mountpoint 守卫输入）。
 fn path_facts(p: &std::path::Path) -> anyhow::Result<(bool, u64, bool, u64)> {
-    let meta = std::fs::metadata(p)
-        .with_context(|| format!("读取挂载点元数据 {}", p.display()))?;
+    let meta = std::fs::metadata(p).with_context(|| format!("读取挂载点元数据 {}", p.display()))?;
     let is_dir = meta.is_dir();
     let size = if is_dir { 0 } else { meta.len() };
     let dir_nonempty = is_dir
@@ -134,7 +139,11 @@ fn sweep_report(residue: &list::LifecycleResidue) -> Vec<String> {
     if residue.dirs.is_empty() {
         lines.push("sweep：无无主会话目录".into());
     } else {
-        lines.push(format!("sweep：无主会话目录 ×{}（{}）", residue.dirs.len(), residue.dirs.join(", ")));
+        lines.push(format!(
+            "sweep：无主会话目录 ×{}（{}）",
+            residue.dirs.len(),
+            residue.dirs.join(", ")
+        ));
     }
     lines
 }
@@ -172,7 +181,10 @@ pub fn run(opts: &GcOpts, profiles: &BTreeMap<String, Profile>) -> anyhow::Resul
         let stale_keys: BTreeSet<&str> = stale.iter().map(|e| e.key.as_str()).collect();
         manifest.retain(|e| !stale_keys.contains(e.key.as_str()));
         manifest::save(&manifest)?;
-        println!("gc --prune: manifest 原子重建（{} entries）", manifest.entries.len());
+        println!(
+            "gc --prune: manifest 原子重建（{} entries）",
+            manifest.entries.len()
+        );
         return Ok(());
     }
 
@@ -191,9 +203,16 @@ pub fn run(opts: &GcOpts, profiles: &BTreeMap<String, Profile>) -> anyhow::Resul
     let mut plan: Vec<String> = Vec::new();
     let mut refusals: Vec<String> = Vec::new();
     let mut mountpoint_reclaim: Vec<Entry> = Vec::new();
-    for e in manifest.entries.iter().filter(|e| e.kind == EntryKind::Mountpoint) {
+    for e in manifest
+        .entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::Mountpoint)
+    {
         let Some(path) = e.path.as_ref() else {
-            refusals.push(format!("mountpoint {} 缺 path（清单损坏；--force 跳过守卫）", e.key));
+            refusals.push(format!(
+                "mountpoint {} 缺 path（清单损坏；--force 跳过守卫）",
+                e.key
+            ));
             continue;
         };
         if !path.exists() {
@@ -203,7 +222,14 @@ pub fn run(opts: &GcOpts, profiles: &BTreeMap<String, Profile>) -> anyhow::Resul
         }
         match path_facts(path) {
             Ok((is_dir, size, dir_nonempty, mtime)) => {
-                if let Err(why) = reclaim_decision(is_dir, size, dir_nonempty, mtime, e.registered_at, opts.force) {
+                if let Err(why) = reclaim_decision(
+                    is_dir,
+                    size,
+                    dir_nonempty,
+                    mtime,
+                    e.registered_at,
+                    opts.force,
+                ) {
                     refusals.push(format!("mountpoint {} ：{why}", e.key));
                 } else {
                     mountpoint_reclaim.push(e.clone());
@@ -229,9 +255,48 @@ pub fn run(opts: &GcOpts, profiles: &BTreeMap<String, Profile>) -> anyhow::Resul
         plan.push(format!(
             "provider 条目除名 {}（二进制永不删除：{}）",
             e.key,
-            e.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+            e.path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
         ));
     }
+    // mark 引擎资源（票 18）：cap-bin = 实删文件（本工具所有，file caps 随文件
+    // 消亡）；route-rule = 除名 + rootful 回滚命令打印（本工具零 sudo——回滚命令
+    // 与 /tmp/iso-cc-exp18/rollback.sh 同源：flush 表 + del 规则）。
+    let mark_reclaim: Vec<Entry> = manifest
+        .entries
+        .iter()
+        .filter(|e| matches!(e.kind, EntryKind::CapBin | EntryKind::RouteRule))
+        .filter(|e| {
+            opts.profile
+                .as_deref()
+                .is_none_or(|p| entry_profile(e) == Some(p))
+        })
+        .cloned()
+        .collect();
+    for e in &mark_reclaim {
+        match e.kind {
+            EntryKind::CapBin => plan.push(format!(
+                "回收 cap-bin {}（mark 助手；file caps 随文件消亡）",
+                e.path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            )),
+            EntryKind::RouteRule => plan
+                .push("回收 route-rule（mark 策略路由面；rootful 回滚命令见执行段）".to_string()),
+            _ => {}
+        }
+    }
+    // 共享面守卫：回收后清单仍有 mark 条目（其他 profile 登记同一助手/路由面）
+    // → 宿主对象仍被登记引用，文件/路由保留，仅除名本次条目。
+    let remaining_mark = manifest
+        .entries
+        .iter()
+        .filter(|e| matches!(e.kind, EntryKind::CapBin | EntryKind::RouteRule))
+        .filter(|e| !mark_reclaim.iter().any(|r| r.key == e.key))
+        .count();
     let profile_state_reclaim: Vec<Entry> = match opts.profile.as_deref() {
         Some(p) => manifest
             .entries
@@ -245,9 +310,15 @@ pub fn run(opts: &GcOpts, profiles: &BTreeMap<String, Profile>) -> anyhow::Resul
         plan.push(format!("回收 profile-state {}（显式 --profile）", e.key));
     }
     if opts.profile.is_none() {
-        let kept = manifest.entries.iter().filter(|e| e.kind == EntryKind::ProfileState).count();
+        let kept = manifest
+            .entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::ProfileState)
+            .count();
         if kept > 0 {
-            plan.push(format!("profile-state 条目 ×{kept} 保留（仅随显式 --profile 回收）"));
+            plan.push(format!(
+                "profile-state 条目 ×{kept} 保留（仅随显式 --profile 回收）"
+            ));
         }
     }
 
@@ -255,7 +326,10 @@ pub fn run(opts: &GcOpts, profiles: &BTreeMap<String, Profile>) -> anyhow::Resul
         for r in &refusals {
             eprintln!("gc --all 拒绝：{r}");
         }
-        bail!("gc --all 未执行任何动作（{} 项拒绝；--force 可显式越过用户数据化守卫）", refusals.len());
+        bail!(
+            "gc --all 未执行任何动作（{} 项拒绝；--force 可显式越过用户数据化守卫）",
+            refusals.len()
+        );
     }
 
     if plan.is_empty() && refusals.is_empty() {
@@ -267,13 +341,30 @@ pub fn run(opts: &GcOpts, profiles: &BTreeMap<String, Profile>) -> anyhow::Resul
     // 执行：sweep 清理。
     for g in &residue.gateways {
         if !crate::ns::kill_pid(g.pid, libc::SIGKILL) {
-            eprintln!("gc --all: 孤儿网关 pid={} 已不可杀（ESRCH/EPERM），跳过", g.pid);
+            eprintln!(
+                "gc --all: 孤儿网关 pid={} 已不可杀（ESRCH/EPERM），跳过",
+                g.pid
+            );
         }
     }
     let sess_root = crate::session::sessions_root()?;
     for d in &residue.dirs {
-        std::fs::remove_dir_all(sess_root.join(d))
-            .with_context(|| format!("移除无主会话目录 sessions/{d}"))?;
+        // 票 18：mark 会话资产根 /var/tmp/iso-cc-mark/sessions 与 netns 根一并对账
+        let mut removed = false;
+        for root in [Some(sess_root.clone()), Some(crate::mark::sessions_root())]
+            .into_iter()
+            .flatten()
+        {
+            let p = root.join(d);
+            if p.exists() {
+                std::fs::remove_dir_all(&p)
+                    .with_context(|| format!("移除无主会话目录 {}", p.display()))?;
+                removed = true;
+            }
+        }
+        if !removed {
+            bail!("无主会话目录 sessions/{d} 在两个状态根均不存在（对账竞态）");
+        }
     }
     // 执行：挂载点回收 + profile-state 回收（路径侧）。
     for e in &mountpoint_reclaim {
@@ -292,23 +383,73 @@ pub fn run(opts: &GcOpts, profiles: &BTreeMap<String, Profile>) -> anyhow::Resul
             }
         }
     }
+    // 执行：mark 资源（票 18）。共享守卫成立 = 仅除名（上面 retain）；最后一个
+    // mark profile 退场 = 实删助手文件 + 打印路由面回滚命令（宿主 diff 归零由
+    // 用户应用保证——应用前 doctor 将按未登记残留 Fail，两级模型诚实态）。
+    if !mark_reclaim.is_empty() && remaining_mark == 0 {
+        for e in &mark_reclaim {
+            if e.kind == EntryKind::CapBin {
+                if let Some(path) = e.path.as_ref() {
+                    if path.exists() {
+                        remove_path(path, false, opts.force)?;
+                    }
+                }
+            }
+        }
+        // mark 状态根扫尾（票 18）：shim 供给二进制 + 仅在已空时移除各级目录
+        //（remove_dir 空目录语义 = 绝不动他人物；非空即留 = 与 netns 共存安全）。
+        let root = crate::mark::state_root();
+        let _ = std::fs::remove_file(root.join("bin").join("iso-cc"));
+        for dir in [
+            root.join("bin"),
+            root.join("sessions"),
+            root.join("profiles"),
+            root,
+        ] {
+            let _ = std::fs::remove_dir(&dir);
+        }
+        // 宿主 state 根下的 mark 助手目录与空 profiles 父目录（空目录语义同上）
+        let sd = crate::manifest::state_dir();
+        let mark_dir = sd.join("mark");
+        for sibling in ["uidrun", "uidrun.meta", "uidrun.c"] {
+            let _ = std::fs::remove_file(mark_dir.join(sibling));
+        }
+        let _ = std::fs::remove_dir(sd.join("mark"));
+        let _ = std::fs::remove_dir(sd.join("profiles"));
+        if mark_reclaim.iter().any(|e| e.kind == EntryKind::RouteRule) {
+            println!("gc: —— mark 路由面 rootful 回滚命令（未执行，逐条应用后宿主 diff 归零）——");
+            for c in crate::mark::teardown_commands() {
+                println!("  {c}");
+            }
+        }
+    } else if !mark_reclaim.is_empty() {
+        println!(
+            "gc: mark 资源仅除名（仍有 {remaining_mark} 条其他 profile 的 mark 条目引用宿主对象；文件/路由保留）"
+        );
+    }
     // 执行：清单重建（mountpoint 回收 + provider 除名 + profile-state 条件回收）。
     let reclaimed_keys: BTreeSet<&str> = mountpoint_reclaim
         .iter()
         .chain(profile_state_reclaim.iter())
+        .chain(mark_reclaim.iter())
         .map(|e| e.key.as_str())
         .collect();
     manifest.retain(|e| match e.kind {
         EntryKind::Provider => false, // 只除名，二进制永不删除
         EntryKind::Mountpoint => !reclaimed_keys.contains(e.key.as_str()),
         EntryKind::ProfileState => !reclaimed_keys.contains(e.key.as_str()),
+        EntryKind::CapBin => !reclaimed_keys.contains(e.key.as_str()),
+        EntryKind::RouteRule => !reclaimed_keys.contains(e.key.as_str()),
     });
     manifest::save(&manifest)?;
 
     // 终态断言：清单与现实一致（残留=0）。
     let after = list::sweep_residue();
     let residue_left = !after.gateways.is_empty() || !after.dirs.is_empty();
-    println!("gc --all: manifest 原子重建（{} entries）", manifest.entries.len());
+    println!(
+        "gc --all: manifest 原子重建（{} entries）",
+        manifest.entries.len()
+    );
     for l in sweep_report(&after) {
         println!("gc --all 终态: {l}");
     }
@@ -337,7 +478,12 @@ mod tests {
     fn profiles(names: &[&str]) -> BTreeMap<String, Profile> {
         names
             .iter()
-            .map(|n| (n.to_string(), toml::from_str(&format!("egress = 'if:x{n}'")).unwrap()))
+            .map(|n| {
+                (
+                    n.to_string(),
+                    toml::from_str(&format!("egress = 'if:x{n}'")).unwrap(),
+                )
+            })
             .collect()
     }
 
@@ -351,7 +497,11 @@ mod tests {
         ];
         let stale = stale_entries(&entries, &profiles(&["web"]));
         let keys: Vec<&str> = stale.iter().map(|e| e.key.as_str()).collect();
-        assert_eq!(keys, vec!["gone:/tmp/a", "gone:state"], "provider 永不按 profile 判 stale");
+        assert_eq!(
+            keys,
+            vec!["gone:/tmp/a", "gone:state"],
+            "provider 永不按 profile 判 stale"
+        );
     }
 
     #[test]
@@ -363,7 +513,10 @@ mod tests {
         };
         assert!(has_active_sessions(&[mk(1, "pasta-1", "cc")]));
         assert!(has_active_sessions(&[mk(2, "pasta-1", "gateway")]));
-        assert!(!has_active_sessions(&[mk(3, "?", "gateway")]), "id=? 的网关指纹 = 孤儿，非活跃会话");
+        assert!(
+            !has_active_sessions(&[mk(3, "?", "gateway")]),
+            "id=? 的网关指纹 = 孤儿，非活跃会话"
+        );
         assert!(!has_active_sessions(&[]));
     }
 
@@ -381,5 +534,18 @@ mod tests {
         assert!(reclaim_decision(false, 0, false, 1_000, 1_000, false).is_ok());
         // --force 越过
         assert!(reclaim_decision(false, 7, false, 1_001, 1_000, true).is_ok());
+    }
+
+    #[test]
+    fn stale_detection_covers_mark_kinds() {
+        // 票 18：cap-bin/route-rule 按 profile 定界 → profile 消失 = stale（--prune 面）
+        let entries = vec![
+            e(EntryKind::CapBin, "gone:uidrun"),
+            e(EntryKind::RouteRule, "gone:route-rule"),
+            e(EntryKind::CapBin, "web:uidrun"),
+        ];
+        let stale = stale_entries(&entries, &profiles(&["web"]));
+        let keys: Vec<&str> = stale.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["gone:uidrun", "gone:route-rule"]);
     }
 }

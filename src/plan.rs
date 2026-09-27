@@ -1,4 +1,4 @@
-use crate::config::{ExecBash, NetGateway, NetIpv6, NetPrivate, Profile};
+use crate::config::{Engine, ExecBash, NetGateway, NetIpv6, NetPrivate, Profile};
 use crate::provider;
 use std::ffi::{OsStr, OsString};
 
@@ -6,6 +6,7 @@ use std::ffi::{OsStr, OsString};
 /// gateway argv 展开与实际 spawn 同源（provider::*::flag_args）——所印即可执行的等价 CLI。
 pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -> Vec<String> {
     let mut v = Vec::new();
+    let mark = p.engine() == Engine::Mark;
     let (iface, socks) = match p.egress() {
         Ok(crate::config::Egress::If(name)) => (name, None),
         Ok(crate::config::Egress::Socks5 { host, port }) => {
@@ -15,13 +16,22 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
     };
     let gateway = p.gateway();
     let dns = p.dns();
-    v.push(format!(
-        "plan[profile={profile_name} scope={:?} exec.bash={:?} ipv6={:?} private={:?} gateway={gateway} dns={dns}]",
-        p.scope(),
-        p.exec_bash(),
-        p.ipv6(),
-        p.net.private.unwrap_or(NetPrivate::Tunnel)
-    ));
+    let header = if mark {
+        format!(
+            "plan[profile={profile_name} engine=mark exec.bash={:?} egress={}]",
+            p.exec_bash(),
+            p.egress
+        )
+    } else {
+        format!(
+            "plan[profile={profile_name} engine=netns scope={:?} exec.bash={:?} ipv6={:?} private={:?} gateway={gateway} dns={dns}]",
+            p.scope(),
+            p.exec_bash(),
+            p.ipv6(),
+            p.net.private.unwrap_or(NetPrivate::Tunnel)
+        )
+    };
+    v.push(header);
     match &socks {
         Some((host, port)) => v.push(format!(
             "0. egress assert: socks5://{host}:{port} TCP-reachable from host (preflight #B); pasta outbound = host default-route iface (must exist + UP, sysfs #3); R8 no fallback"
@@ -30,73 +40,117 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
             "0. egress assert: {iface} must exist + UP on host (sysfs #3); lo/tap0 rejected (#12 `-I` rule)"
         )),
     }
-    match gateway {
-        NetGateway::Pasta => {
-            // pasta 全实参（含 `-I` 硬规则）；plan 期 session-id 未生成 → 占位
-            let log = OsStr::new("<sessions/<session-id>/gateway.log>");
-            // socks 形态省略显式 outbound（map-host-loopback 失效取证，工单 16）
-            let outbound = if socks.is_some() { None } else { Some(iface.as_str()) };
-            let flags = provider::pasta::flag_args(outbound, dns, log)
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-            v.push(format!(
+    if mark {
+        // mark 引擎（票 18）：uid 策略路由 + file-cap 助手会话根（零 netns）
+        v.push(format!(
+            "1. gateway=mark uid-route (zero netns, 票 18): session root = <state>/mark/uidrun (cap_setuid,cap_setgid=ep, uid {} compile-time) -- <cmd>; whole tree uid={} → ip rule pref {} uidrange → table {} → {} → tunnel",
+            crate::config::MARK_UID,
+            crate::config::MARK_UID,
+            crate::config::MARK_RULE_PREF,
+            crate::config::MARK_TABLE,
+            iface
+        ));
+        v.push(
+            "1b. fail-closed: table 内 unreachable default 兜底（v4+v6）——tun down = ENETUNREACH 快速失败，绝不 fall-through main 表（阶段 A 发现 1）".into(),
+        );
+        v.push(
+            "2. bootstrap: NONE — zero netns/mountns by declaration (binds/localhost_forward/ipv6-off 机制面结构性不适用; lifecycle = 助手常驻 reaper: subreaper + PDEATHSIG 链 + 同 uid 收编击杀, R8/US18)".into(),
+        );
+    } else {
+        match gateway {
+            NetGateway::Pasta => {
+                // pasta 全实参（含 `-I` 硬规则）；plan 期 session-id 未生成 → 占位
+                let log = OsStr::new("<sessions/<session-id>/gateway.log>");
+                // socks 形态省略显式 outbound（map-host-loopback 失效取证，工单 16）
+                let outbound = if socks.is_some() {
+                    None
+                } else {
+                    Some(iface.as_str())
+                };
+                let flags = provider::pasta::flag_args(outbound, dns, log)
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                v.push(format!(
                 "1. gateway=pasta spawn (session root): pasta {flags} -- <iso-cc> session-bootstrap --plan <json> --session-id <session-id> -- <cmd>"
             ));
-            v.push(
+                v.push(
                 "2. bootstrap(mode=mountns): PDEATHSIG->pasta + getppid check; unshare CLONE_NEWNS; rprivate /; bind_rw x M + bind_ro x N".into(),
             );
-            if let Some((_, port)) = &socks {
-                let worker_flags = provider::socks::worker_args_for_url(format!(
-                    "socks5://<tap0-gw>:{port}"
-                ))
-                .iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join(" ");
-                v.push(format!(
+                if let Some((_, port)) = &socks {
+                    let worker_flags =
+                        provider::socks::worker_args_for_url(format!("socks5://<tap0-gw>:{port}"))
+                            .iter()
+                            .map(|a| a.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                    v.push(format!(
                     "1b. socks worker (bootstrap spawns in-ns, marked ISO_CC_SESSION, PDEATHSIG->bootstrap): tun2proxy {worker_flags}  (proxy host = tap0 default-route gateway via netlink = pasta gw = host loopback mapping)"
                 ));
-                v.push(
+                    v.push(
                     "1b1. worker log sessions/<id>/worker.log; ready = netlink wait tun1; worker death = protocol blackhole (fail-closed R8, never falls back to direct)"
                         .into(),
                 );
-                v.push(
+                    v.push(
                     "1b2. DNS: tun2proxy takes over resolv.conf in-ns (virtual DNS 10.0.0.1 via tun1, remote resolve via proxy; bind_ro override proven in exp16 probe4)"
                         .into(),
                 );
+                }
             }
-        }
-        NetGateway::Slirp4netns => {
-            v.push(
+            NetGateway::Slirp4netns => {
+                v.push(
                 "1. gateway=slirp4netns (fallback, attach): slirp4netns <bootstrap-pid> tap0 -c"
                     .into(),
             );
-            v.push(
+                v.push(
                 "2. bootstrap(mode=selfmap): parent pre_exec unshare CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWNET + self single-entry maps + rprivate + rw/ro binds + PDEATHSIG->iso-cc (parent never writes /proc/<pid>/maps)".into(),
             );
+            }
         }
     }
     // bind 清单（会话资产位于 sessions/<session-id>/，并发互踩已修复）
     if p.locale.tz.is_some() {
         let tz = p.locale.tz.as_deref().unwrap_or("?");
-        v.push(format!(
-            "3. bind sessions/<id>/localtime + timezone (tzdb: {tz}) -> /etc/localtime + /etc/timezone"
-        ));
+        if mark {
+            v.push(format!(
+                "3. TZ env only: TZ={tz} (零 mountns：/etc/* bind 不适用；R2 视线主 = TZ env + Intl，票 18)"
+            ));
+        } else {
+            v.push(format!(
+                "3. bind sessions/<id>/localtime + timezone (tzdb: {tz}) -> /etc/localtime + /etc/timezone"
+            ));
+        }
     } else {
         v.push("3. (no tz declared — host default)".into());
     }
-    v.push(format!(
-        "4. bind sessions/<id>/resolv.conf -> /etc/resolv.conf (nameserver {dns})"
-    ));
+    if mark {
+        v.push(
+            "4. DNS: host resolver path（已登记例外：DNS 元数据不被 uid 钉定，resolv bind 无 mountns 承载；数据面 TCP 仍 fail-closed——票 18 发现 3）".into(),
+        );
+    } else {
+        v.push(format!(
+            "4. bind sessions/<id>/resolv.conf -> /etc/resolv.conf (nameserver {dns})"
+        ));
+    }
     // 票 05（R4/D6）：内置对展开可见——rw bind backing（profile 持久态）→ view（cc 默认路径）
-    if p.cc_isolation() {
+    if mark && p.cc_isolation() {
+        let backing0 = crate::mark::cc_builtin_pairs_mark(profile_name)[0].backing.clone();
+        v.push(
+            format!(
+                "4c. cc_isolation=true (mark form, 票 18): HOME rewritten to {}（uid DAC 属主）→ cc 无感走默认 ~/.claude 路径；宿主 ~/.claude 对 uid 4210 DAC 不可达；CLAUDE_CONFIG_DIR unset",
+                backing0.display()
+            ),
+        );
+    } else if p.cc_isolation() {
         v.push(
             "4c. cc_isolation=true (R4/D6): builtin rw binds, backing = profiles/<p>/ persistent state (clean-room, cross-session); unset CLAUDE_CONFIG_DIR in session env"
                 .into(),
         );
-        for (i, pair) in crate::config::cc_builtin_pairs(profile_name).into_iter().enumerate() {
+        for (i, pair) in crate::config::cc_builtin_pairs(profile_name)
+            .into_iter()
+            .enumerate()
+        {
             v.push(format!(
                 "4c{}. rw bind {} -> {}",
                 i + 1,
@@ -114,34 +168,52 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
         let (src, dst) = r.split_once('=').unwrap_or((r.as_str(), "?"));
         v.push(format!("5. bind {src} -> {dst}"));
     }
-    v.push(
-        "6. tap self-config by provider (pasta --config-net / slirp -c): no ip addr/route commands"
-            .into(),
-    );
-    if p.ipv6() == NetIpv6::Off {
+    if mark {
+        v.push("6. (self-config N/A — zero netns: no tap, no in-ns config)".into());
+    } else {
         v.push(
-            "7. ipv6=off: /proc/sys disable_ipv6 direct-write in bootstrap (landed with issue 12; sysctl sh removed in 09)".into(),
+            "6. tap self-config by provider (pasta --config-net / slirp -c): no ip addr/route commands"
+                .into(),
         );
-    }
-    for port in &p.net.localhost_forward {
-        v.push(format!(
-            "8. relay 127.0.0.1:{port} -> gateway -> host loopback"
-        ));
+        if p.ipv6() == NetIpv6::Off {
+            v.push(
+                "7. ipv6=off: /proc/sys disable_ipv6 direct-write in bootstrap (landed with issue 12; sysctl sh removed in 09)".into(),
+            );
+        }
+        for port in &p.net.localhost_forward {
+            v.push(format!(
+                "8. relay 127.0.0.1:{port} -> gateway -> host loopback"
+            ));
+        }
     }
     for (k, val) in &p.env {
         v.push(format!("9. env {k}={val:?}"));
     }
     // 票 15（spec 变更（四））：两轴独立声明，--print-plan 展开全部组合
-    v.push(format!(
-        "10a. net.scope={:?}: identity scope（tree=整树入 netns 一致性 US2；self=cc 本体面收窄，verify 探针恒测 cc 本体）",
-        p.scope()
-    ));
+    if mark {
+        v.push(
+            "10a. identity scope (mark): 整树 uid=4210（uidrange 命中面 = 会话全部子孙；net.scope 轴不适用，票 18）"
+                .into(),
+        );
+    } else {
+        v.push(format!(
+            "10a. net.scope={:?}: identity scope（tree=整树入 netns 一致性 US2；self=cc 本体面收窄，verify 探针恒测 cc 本体）",
+            p.scope()
+        ));
+    }
     match p.exec_bash() {
         ExecBash::Sandbox => {
-            v.push(
-                "10b. exec.bash=sandbox: bash 工具留在会话内执行（继承 netns；行为与现状等价）"
-                    .into(),
-            );
+            if mark {
+                v.push(
+                    "10b. exec.bash=sandbox: bash 工具留在会话内执行（继承会话 uid 与路由面；行为与现状等价，票 18）"
+                        .into(),
+                );
+            } else {
+                v.push(
+                    "10b. exec.bash=sandbox: bash 工具留在会话内执行（继承 netns；行为与现状等价）"
+                        .into(),
+                );
+            }
         }
         ExecBash::Host => {
             v.push(
@@ -157,11 +229,18 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
             );
         }
     }
-    v.push(format!(
-        "10c. combo: net.scope={:?} + exec.bash={:?}",
-        p.scope(),
-        p.exec_bash()
-    ));
+    if mark {
+        v.push(format!(
+            "10c. combo: engine=mark + exec.bash={:?}",
+            p.exec_bash()
+        ));
+    } else {
+        v.push(format!(
+            "10c. combo: net.scope={:?} + exec.bash={:?}",
+            p.scope(),
+            p.exec_bash()
+        ));
+    }
     match command {
         Some(c) => v.push(format!(
             "11. exec {} (env: TZ/LANG/CLAUDE 重定向已生效)",
@@ -253,18 +332,31 @@ mod tests {
         assert!(joined.contains("multi-call shim"), "{joined}");
         // 两轴独立：scope 默认 tree 与 host 组合可见（变更（四）四组合之 tree+host）
         assert!(joined.contains("net.scope=Tree"), "{joined}");
-        assert!(joined.contains("combo: net.scope=Tree + exec.bash=Host"), "{joined}");
+        assert!(
+            joined.contains("combo: net.scope=Tree + exec.bash=Host"),
+            "{joined}"
+        );
     }
 
     #[test]
     fn plan_expands_all_four_combos() {
         for (scope, bash, combo) in [
-            ("tree", "sandbox", "combo: net.scope=Tree + exec.bash=Sandbox"),
+            (
+                "tree",
+                "sandbox",
+                "combo: net.scope=Tree + exec.bash=Sandbox",
+            ),
             ("tree", "host", "combo: net.scope=Tree + exec.bash=Host"),
             ("self", "host", "combo: net.scope=Self_ + exec.bash=Host"),
-            ("self", "sandbox", "combo: net.scope=Self_ + exec.bash=Sandbox"),
+            (
+                "self",
+                "sandbox",
+                "combo: net.scope=Self_ + exec.bash=Sandbox",
+            ),
         ] {
-            let p = prof(&format!("egress = 'if:wg0'\nnet.scope = '{scope}'\nexec.bash = '{bash}'"));
+            let p = prof(&format!(
+                "egress = 'if:wg0'\nnet.scope = '{scope}'\nexec.bash = '{bash}'"
+            ));
             let lines = plan_lines("x", &p, None);
             assert!(
                 lines.iter().any(|l| l.contains(combo)),
@@ -280,7 +372,10 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains("exec.bash=Sandbox"), "{joined}");
         assert!(joined.contains("行为与现状等价"), "{joined}");
-        assert!(!joined.contains("exec.sock"), "sandbox 不得出现 exec.sock 通道面: {joined}");
+        assert!(
+            !joined.contains("exec.sock"),
+            "sandbox 不得出现 exec.sock 通道面: {joined}"
+        );
     }
 
     #[test]
@@ -329,11 +424,9 @@ mod tests {
         assert!(joined.contains("unset CLAUDE_CONFIG_DIR"), "{joined}");
         for key in ["claude", "claude.json", "claude.json.backup"] {
             assert!(
-                lines
-                    .iter()
-                    .any(|l| l.starts_with("4c")
-                        && l.contains("rw bind ")
-                        && l.contains(&format!("profiles/ccx/{key}"))),
+                lines.iter().any(|l| l.starts_with("4c")
+                    && l.contains("rw bind ")
+                    && l.contains(&format!("profiles/ccx/{key}"))),
                 "缺 {key} 展开: {lines:?}"
             );
         }
@@ -345,6 +438,34 @@ mod tests {
         let lines = plan_lines("ccx", &p, None);
         let joined = lines.join("\n");
         assert!(joined.contains("4c. cc_isolation=false"), "{joined}");
-        assert!(!joined.contains("rw bind"), "false 轴不得出现内置对: {joined}");
+        assert!(
+            !joined.contains("rw bind"),
+            "false 轴不得出现内置对: {joined}"
+        );
+    }
+
+    #[test]
+    fn mark_engine_plan_declares_uid_route_and_zero_netns() {
+        let p = prof("egress = 'if:mihomo-tun'\nnet.engine = 'mark'\nlocale.tz = 'Asia/Singapore'");
+        let lines = plan_lines("sg", &p, None);
+        let joined = lines.join("\n");
+        assert!(joined.contains("engine=mark"), "{joined}");
+        assert!(joined.contains("gateway=mark uid-route"), "{joined}");
+        assert!(joined.contains("uid 4210"), "{joined}");
+        assert!(joined.contains("table 5182"), "{joined}");
+        assert!(joined.contains("unreachable default"), "{joined}");
+        assert!(joined.contains("bootstrap: NONE"), "{joined}");
+        assert!(joined.contains("HOME rewritten"), "{joined}");
+        assert!(joined.contains("host resolver"), "{joined}");
+        // netns 机制面不出现（零 netns 声明的可读面）
+        assert!(!joined.contains("pasta "), "{joined}");
+        assert!(!joined.contains("session-bootstrap"), "{joined}");
+        assert!(!joined.contains("localhost_forward relay"), "{joined}");
+        // 绑定面回归锚（票 18 集成缺口）：4c 行必须给出 mark 状态根的具体 backing
+        let want_backing = crate::mark::cc_builtin_pairs_mark("sg")[0]
+            .backing
+            .display()
+            .to_string();
+        assert!(joined.contains(&want_backing), "{joined}");
     }
 }

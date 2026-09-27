@@ -1,4 +1,4 @@
-use crate::config::{ExecBash, NetGateway, NetIpv6, Profile};
+use crate::config::{Engine, ExecBash, NetGateway, NetIpv6, Profile};
 use crate::execrpc;
 use crate::list;
 use crate::netcfg;
@@ -117,11 +117,17 @@ pub enum ChildMode {
 /// - `if:`：#12 撞名拒绝 + #3 sysfs UP 断言。
 /// - `socks5://`：outbound = 宿主默认路由接口（#3）；proxy 端口宿主 TCP 可达
 ///   （#B 预检，R8：绝不回落）。
-pub fn egress_preflight(profile: &Profile) -> anyhow::Result<(String, Option<SocksPlan>)> {
+pub fn egress_preflight(
+    profile_name: &str,
+    profile: &Profile,
+) -> anyhow::Result<(String, Option<SocksPlan>)> {
     match profile.egress().map_err(anyhow::Error::from)? {
         crate::config::Egress::If(name) => {
             provider::validate_egress_iface(&name)?;
             provider::host_iface_up(&name)?;
+            if profile.engine() == Engine::Mark {
+                mark_preflight(profile_name, profile, &name)?;
+            }
             Ok((name, None))
         }
         crate::config::Egress::Socks5 { host, port } => {
@@ -144,9 +150,45 @@ pub fn egress_preflight(profile: &Profile) -> anyhow::Result<(String, Option<Soc
     }
 }
 
+/// mark 引擎 spawn 前 fail-loud 预检（票 18；R8：绝不静默 fail-open）：
+/// ① 路由面五件套（v4 规则/dev 路由/unreachable 兜底 + v6 规则/兜底）——任一缺失
+/// 即拒绝（uid 流量会 fall-through main 表 = 宿主出口泄漏）；② file-cap 在位真实
+/// 断言（助手 --probe 真降权一次）；③ CC backing 属主（chown 未应用 = cc 不可写）。
+fn mark_preflight(profile_name: &str, profile: &Profile, iface: &str) -> anyhow::Result<()> {
+    let face = crate::mark::route_face(iface);
+    let missing = face.missing(iface);
+    if !missing.is_empty() {
+        return Err(anyhow!(
+            "mark 路由面缺失（fail-closed 前提，绝不静默 fail-open）：{}——运行 `iso-cc setup` 并逐条应用其 rootful 步骤",
+            missing.join("、")
+        ));
+    }
+    let helper = crate::mark::pinned_helper(profile_name)?;
+    crate::mark::probe_helper(&helper)?;
+    if profile.cc_isolation() {
+        let base = crate::mark::home_root(profile_name);
+        let meta = std::fs::metadata(&base).with_context(|| {
+            format!(
+                "CC backing 基目录 {} 缺失——先运行 `iso-cc setup`",
+                base.display()
+            )
+        })?;
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.uid() != crate::config::MARK_UID {
+            return Err(anyhow!(
+                "CC backing {} 属主 = {} ≠ {}：rootful chown 未应用——应用 `iso-cc setup` 输出的 rootful 步骤",
+                base.display(),
+                meta.uid(),
+                crate::config::MARK_UID
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// 会话入口：egress fail-loud 断言 → 会话资产（sessions/<id>/）→ 网关 provider 化 spawn。
 pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::Result<Session> {
-    let (egress_iface, socks_plan) = egress_preflight(profile)?;
+    let (egress_iface, socks_plan) = egress_preflight(profile_name, profile)?;
     // L2（设计稿 §4-L2）：会话树建立前自设 subreaper——收编循环的 reparent 前提
     // （原语 = ns::set_child_subreaper，票 14 归位）。
     ns::set_child_subreaper().map_err(|e| anyhow!("PR_SET_CHILD_SUBREAPER 失败: {e}"))?;
@@ -165,6 +207,45 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
     let sess_dir = session_dir(&session_id)?;
     std::fs::create_dir_all(&sess_dir)
         .with_context(|| format!("创建会话资产目录 {}", sess_dir.display()))?;
+
+    // mark 引擎（票 18）：零 netns 会话——会话根 = file-cap 助手（降权 + 常驻
+    // reaper）。netns 编排（locale/resolv binds、redirect/rw bind 检查、bootstrap
+    // plan、网关 provider）整体不适用；TZ/LANG/env/CLAUDE_CONFIG_DIR/exec.bash
+    // 轴语义原样保留（env 面引擎无关）。
+    if profile.engine() == Engine::Mark {
+        let mut inner = build_inner(&mode, profile_name, profile);
+        if matches!(mode, ChildMode::Probe) {
+            // verify 探针执行器同样从 mark 根取二进制（uid 4210 不可达宿主 target/ 链）
+            let shim = crate::mark::ensure_shim_binary()?;
+            inner[0] = shim.into_os_string();
+        }
+        // mark 会话可见资产（exec.sock/shim）落 mark 状态根（uid 4210 可遍历；
+        // 宿主 $HOME 0700 链路不可达——票 18 宿主矩阵实测）。
+        let mark_sess_dir = crate::mark::sessions_root().join(&session_id);
+        std::fs::create_dir_all(&mark_sess_dir).with_context(|| {
+            format!("创建 mark 会话资产目录 {}", mark_sess_dir.display())
+        })?;
+        let exec_channel = match profile.exec_bash() {
+            ExecBash::Host => Some(execrpc::prepare(&mark_sess_dir, profile, &session_id, true)?),
+            ExecBash::Sandbox => None,
+        };
+        let ctx = SpawnCtx {
+            session_id: &session_id,
+            sess_dir: &mark_sess_dir,
+            plan: &BootstrapPlan {
+                mode: BootstrapMode::Mountns,
+                ipv6_off: true,
+                rw_binds: Vec::new(),
+                binds: Vec::new(),
+                iface: String::new(),
+                timeout_ms: 0,
+                socks: None,
+            },
+            gateway_bin: PathBuf::new(),
+            exec: exec_channel,
+        };
+        return spawn_mark(ctx, profile_name, profile, inner);
+    }
 
     // locale 资产：tzdb 内嵌 TZif（宿主无 tzdata 也成立），写会话目录供 bind。
     let mut binds: Vec<(PathBuf, String)> = Vec::new();
@@ -205,10 +286,20 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
     // backing（profiles/<profile>/ 持久态）→ view（cc 默认路径）。挂载点两侧均由
     // setup 收敛并登记（backing=profile-state，view 预创建=mountpoint）；run 期
     // 缺失仍 fail-loud（票 14 契约不变）。false = 无内置对（共享语义，现状等价）。
+    // 引擎轴（票 18）：backing 派生按引擎切换——mark 的 backing 在 mark 状态根
+    //（/var/tmp/iso-cc-mark/profiles/<p>，uid DAC 属主），不在宿主 state 根。
     let mut rw_binds: Vec<(PathBuf, String)> = Vec::new();
     if profile.cc_isolation() {
-        for pair in crate::config::cc_builtin_pairs(profile_name) {
-            for (side, path) in [("backing", pair.backing.as_path()), ("view", pair.view.as_path())] {
+        let pairs = if profile.engine() == Engine::Mark {
+            crate::mark::cc_builtin_pairs_mark(profile_name)
+        } else {
+            crate::config::cc_builtin_pairs(profile_name)
+        };
+        for pair in pairs {
+            for (side, path) in [
+                ("backing", pair.backing.as_path()),
+                ("view", pair.view.as_path()),
+            ] {
                 if !path.exists() {
                     bail!(
                         "挂载点 {} 缺失（cc 内置对 {key} 的 {side}，fail-loud：run 零预创建）——先运行 `iso-cc setup` 收敛并登记",
@@ -225,11 +316,11 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
     // exec.sock bind+0600）。fallible 须在网关 spawn 前——env 注入需要通道路径。
     // 网关二进制解析（fail-loud #2 清单门）须先于通道 prepare：prepare 落盘
     // sock/shim，若其后才因清单缺失 bail，会把会话资产留成 residue（21:01 冒烟实测）。
-    let gateway_bin = provider::gateway_bin(gateway)?;
     // exec RPC 通道（票 15 spec#1）：exec.bash=host 时装配（bin/bash shim 符号链接 +
     // exec.sock bind+0600）。fallible 须在网关 spawn 前——env 注入需要通道路径。
+    let gateway_bin = provider::gateway_bin(gateway)?;
     let exec_channel = match profile.exec_bash() {
-        ExecBash::Host => Some(execrpc::prepare(&sess_dir, profile, &session_id)?),
+        ExecBash::Host => Some(execrpc::prepare(&sess_dir, profile, &session_id, false)?),
         ExecBash::Sandbox => None,
     };
 
@@ -254,27 +345,7 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
         socks: socks_plan,
     };
 
-    let inner: Vec<OsString> = match &mode {
-        ChildMode::Exec(cmdline) => cmdline.clone(),
-        ChildMode::Probe => {
-            let mut v = vec![
-                std::env::current_exe()
-                    .expect("current_exe 不可用")
-                    .into_os_string(),
-                OsString::from("probe-json"),
-            ];
-            if let Some(tz) = &profile.locale.tz {
-                v.push(OsString::from("--expect-tz"));
-                v.push(tz.clone().into());
-            }
-            // P8 写集探针（票 05）的允许根：声明重定向集 ∪ R4 白名单 ∪ 工具状态根。
-            for root in p8_allowed_roots(profile_name, profile) {
-                v.push(OsString::from("--allow-under"));
-                v.push(root.into_os_string());
-            }
-            v
-        }
-    };
+    let inner = build_inner(&mode, profile_name, profile);
 
     // spawn 上下文（票 15 收敛参数面：exec 通道加入后 spawn_pasta 触 clippy 8 参上限）
     let ctx = SpawnCtx {
@@ -308,6 +379,10 @@ fn p8_allowed_roots(profile_name: &str, profile: &Profile) -> Vec<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let home = Path::new(&home);
     let mut roots = vec![crate::manifest::state_dir()];
+    if profile.engine() == Engine::Mark {
+        // mark：会话可见写面在 mark 状态根（HOME 重写目标 + 会话资产），票 18
+        roots.push(crate::mark::state_root());
+    }
     if profile.cc_isolation() {
         roots.extend(
             crate::config::cc_builtin_pairs(profile_name)
@@ -437,7 +512,11 @@ fn spawn_pasta(
 
 /// gateway=slirp4netns（回退，设计稿 §1.3 下树）：bootstrap 自映射进三 ns（selfmap，
 /// 父侧 pre_exec），slirp4netns attach；parent 永不写 /proc/<pid>/maps（Facts §3 残留源消灭）。
-fn spawn_slirp(mut ctx: SpawnCtx<'_>, profile: &Profile, inner: Vec<OsString>) -> anyhow::Result<Session> {
+fn spawn_slirp(
+    mut ctx: SpawnCtx<'_>,
+    profile: &Profile,
+    inner: Vec<OsString>,
+) -> anyhow::Result<Session> {
     let session_id = ctx.session_id;
     let sess_dir = ctx.sess_dir;
     let plan = ctx.plan;
@@ -460,7 +539,9 @@ fn spawn_slirp(mut ctx: SpawnCtx<'_>, profile: &Profile, inner: Vec<OsString>) -
     let rw = ns::cstring_binds(&plan.rw_binds).context("rw bind 路径预转换")?;
     let binds = ns::cstring_binds(&plan.binds).context("bind 路径预转换")?;
     let expected_ppid = std::process::id();
-    ns::install_pre_exec(&mut bs, move || ns::enter_selfmap_ns(&rw, &binds, expected_ppid));
+    ns::install_pre_exec(&mut bs, move || {
+        ns::enter_selfmap_ns(&rw, &binds, expected_ppid)
+    });
     let root = bs
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -507,6 +588,123 @@ fn spawn_slirp(mut ctx: SpawnCtx<'_>, profile: &Profile, inner: Vec<OsString>) -
     })
 }
 
+/// 会话内命令向量（两引擎共用）：Exec = 原命令行；Probe = 内嵌纯净度探针
+/// （--expect-tz + P8 允许根注入）。
+fn build_inner(mode: &ChildMode, profile_name: &str, profile: &Profile) -> Vec<OsString> {
+    match mode {
+        ChildMode::Exec(cmdline) => cmdline.clone(),
+        ChildMode::Probe => {
+            let mut v = vec![
+                std::env::current_exe()
+                    .expect("current_exe 不可用")
+                    .into_os_string(),
+                OsString::from("probe-json"),
+            ];
+            if let Some(tz) = &profile.locale.tz {
+                v.push(OsString::from("--expect-tz"));
+                v.push(tz.clone().into());
+            }
+            // P8 写集探针（票 05）的允许根：声明重定向集 ∪ R4 白名单 ∪ 工具状态根。
+            for root in p8_allowed_roots(profile_name, profile) {
+                v.push(OsString::from("--allow-under"));
+                v.push(root.into_os_string());
+            }
+            v
+        }
+    }
+}
+
+/// gateway=mark（票 18）：会话根 = file-cap 助手（编译期 uid 降权 + 常驻 reaper）。
+/// 零 netns/mountns：binds/forward/ipv6 轴结构性不适用；生命周期 = 助手 subreaper +
+/// PDEATHSIG 链 + 同 uid 收编（uid 4210 树对 iso-cc 的 kill/wait 全 EPERM——阶段 A
+/// 事故留档——树死亡保证必须由同 uid 成员结构性执行，R8/US18）。
+fn spawn_mark(
+    mut ctx: SpawnCtx<'_>,
+    profile_name: &str,
+    profile: &Profile,
+    inner: Vec<OsString>,
+) -> anyhow::Result<Session> {
+    let session_id = ctx.session_id;
+    let sess_dir = ctx.sess_dir;
+    let exec = &mut ctx.exec;
+    let helper = crate::mark::pinned_helper(profile_name)?;
+
+    let mut cmd = Command::new(&helper);
+    // argv 可见性 flag（list/sweep 的 /proc/cmdline 键：uid 4210 树的 environ 对
+    // 宿主 EACCES，env 标记键在 mark 引擎不可读——cmdline 全局可读）。
+    cmd.arg("--session-id").arg(session_id);
+    cmd.arg("--");
+    for a in &inner {
+        cmd.arg(a);
+    }
+    // 双标记（env 面语义与 pasta/slirp 一致）
+    cmd.env("ISO_CC_SESSION", session_id);
+    // TZ/LANG/env/CLAUDE_CONFIG_DIR 摘除 + exec.bash=host 拦截分层注入（引擎无关）
+    apply_env(&mut cmd, profile, exec.as_ref());
+    // mark 版 CC 隔离（R4/D6 的 mark 形态）：HOME 重写 → backing（uid 4210 DAC
+    // 属主），cc 无感走默认 ~/.claude 路径；宿主 ~/.claude 对 uid 4210 DAC 不可达。
+    if profile.cc_isolation() {
+        cmd.env("HOME", crate::mark::home_root(profile_name));
+    }
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    // PDEATHSIG→iso-cc + 精确对账（ns.rs §4-L1）：iso-cc 死 ⇒ 助手死 ⇒ cc 链式死
+    let expected_ppid = std::process::id();
+    ns::install_pre_exec(&mut cmd, move || {
+        ns::set_pdeathsig_verified(libc::SIGKILL, expected_ppid)
+    });
+    let mut root = cmd
+        .spawn()
+        .with_context(|| format!("spawn mark 会话根（{}）", helper.display()))?;
+    // KillGuard（audit-facts §3）：降权后的助手对宿主 SIGKILL EPERM——本窗口内
+    // 失败路径都是助手自身已死（快速失败检测），kill 得 ESRCH 无害；存活助手的
+    // bail 面为空（spawn 后仅剩 try_wait 窗口与 infallible 构造）。
+    let guard = KillGuard::arm(root.id());
+
+    // fail-loud：助手快速失败检测（launch-failure 退出码契约：1 = 降权/fork 失败
+    // （file caps 缺失最常见），2 = 用法错误）。目标命令自身的快速退出（含 shell
+    // 约定 126/127/信号）原样透传，不劫持语义。
+    std::thread::sleep(Duration::from_secs(1));
+    if let Some(status) = root.try_wait().context("try_wait mark 会话根")? {
+        match status.code() {
+            Some(1) | Some(2) => bail!(
+                "mark 会话根启动失败（exit={}，fail-loud）：助手降权被拒——file caps 缺失或清单未收敛；运行 `iso-cc setup` 并逐条应用其 rootful 步骤（setcap/chown/ip rule）",
+                status.code().unwrap_or(-1)
+            ),
+            _ => {
+                // exec 已发生（或 exec 失败 127/信号死）：目标命令自身的退出态，透传。
+            }
+        }
+    }
+
+    eprintln!(
+        "[iso-cc] session {session_id}: root=uidrun(pid={}) engine=mark uid={} egress-iface={}（uidrange→table {} + unreachable backstop）exec.bash={:?} assets={}",
+        root.id(),
+        crate::config::MARK_UID,
+        egress_iface_of(profile),
+        crate::config::MARK_TABLE,
+        profile.exec_bash(),
+        sess_dir.display()
+    );
+    guard.disarm();
+    // serve 启动点（启动不失败）：置于最后可失败操作之后，KillGuard 面不扩大。
+    let exec_server = exec.take().map(execrpc::ExecChannel::serve);
+    Ok(Session {
+        root,
+        gateway: None,
+        sess_dir: sess_dir.to_path_buf(),
+        exec_server,
+    })
+}
+
+/// mark banner 的 egress 展示（preflight 已断言 if: 形态；socks 在 validate 已拒）。
+fn egress_iface_of(profile: &Profile) -> String {
+    profile
+        .egress_iface()
+        .map(str::to_string)
+        .unwrap_or_else(|_| "<invalid-egress>".into())
+}
 
 /// session-bootstrap 主体（§1.4 新参面）：plan 解析（#5 fail-loud）→ 自设会话标记
 /// → 按模式进 ns（mountns：pasta 之下由本进程自建；selfmap：父侧 pre_exec 已完成）
@@ -585,8 +783,8 @@ fn spawn_socks_worker_and_wait(
     let bin = provider::pinned_bin(provider::socks::WORKER_KEY)?;
     // worker 日志 → sessions/<id>/worker.log（对齐 slirp 的 gateway.log 取证形态）
     let log_file = session_dir(session_id)?.join("worker.log");
-    let log = std::fs::File::create(&log_file)
-        .with_context(|| format!("创建 {}", log_file.display()))?;
+    let log =
+        std::fs::File::create(&log_file).with_context(|| format!("创建 {}", log_file.display()))?;
     let gw = netcfg::default_gateway(&plan.iface)
         .map_err(|e| anyhow!("worker 代理地址发现失败（{e}）；tap0 未就绪或无默认路由"))?;
     let mut c = Command::new(&bin);
@@ -735,6 +933,14 @@ fn session_dir(session_id: &str) -> anyhow::Result<PathBuf> {
 fn apply_env(cmd: &mut Command, profile: &Profile, exec: Option<&execrpc::ExecChannel>) {
     if let Some(tz) = &profile.locale.tz {
         cmd.env("TZ", tz);
+        // NixOS 宿主矩阵：tzdata 在 /etc/zoneinfo，TZDIR 只在 login env（会话
+        // 常缺失）——缺失且该根有所声明时区数据时补齐，否则 glibc 解析 TZ 失败
+        // 回落 UTC（P6a 实测 +0000）。引擎无关（env 面，不依赖 mountns bind）。
+        if std::env::var_os("TZDIR").is_none()
+            && Path::new("/etc/zoneinfo").join(tz).exists()
+        {
+            cmd.env("TZDIR", "/etc/zoneinfo");
+        }
     }
     if let Some(lang) = &profile.locale.lang {
         cmd.env("LANG", lang);
@@ -852,7 +1058,10 @@ mod tests {
             }),
         };
         let json = serde_json::to_string(&plan).unwrap();
-        assert!(json.contains("\"socks\":{\"port\":7891,\"tun\":\"tun1\"}"), "{json}");
+        assert!(
+            json.contains("\"socks\":{\"port\":7891,\"tun\":\"tun1\"}"),
+            "{json}"
+        );
         let back: BootstrapPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(back, plan);
         // 旧 plan JSON（无 socks 键）仍可解析：serde(default) 只补缺，不拒旧态
