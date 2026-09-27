@@ -1,0 +1,61 @@
+# 工单 08：nfpm 单声明 → deb/rpm/apk（发行版原生包形态）。
+#
+# podman 模式的「依赖下放发行版」腿：iso-cc 单二进制，网络 helper 由发行版包提供，
+# 版本下限 = 实测证据（/tmp/iso-cc-exp08/）：
+#   - pasta：Ubuntu noble 0.0~git20240220.1e6f92b 二进制逐 flag 验证 -f/-q/-l/
+#     --config-net/-I/--dns-forward/--no-ndp/--no-dhcpv6/--no-ra/--outbound-if4 全在，
+#     故 deb 下限钉该版本（dpkg 语义下 bookworm 1.0~git* 与 trixie 0.0~git2026* 均满足）。
+#   - slirp4netns：实际使用面仅 `attach <pid> tap0 -c`（src/provider/slirp.rs），
+#     -c 为 0.x 期特性；下限 1.2.0（2022-09，bookworm/trixie/fedora/alpine 均满足）。
+#   - tun2proxy：socks 形态增强件 → Recommends（deb/rpm 弱依赖）；apk 无 recommends
+#     语义，由说明文档承担。
+#
+# 变量（nfpm os.ExpandEnv，无 :- 默认值语法，调用方必须显式导出）：
+#   ISO_CC_NFPM_VERSION — 纯 semver（tag 去 v 前缀）。
+# 注意：nfpm 对 contents.src 不做 env 展开（glob 先行），故二进制走固定 staging 路径
+# packaging/dist/pkgroot/iso-cc——调用方先把构建产物拷进去（release.yml / 本地验证同）。
+name: iso-cc
+arch: amd64
+platform: linux
+version: ${ISO_CC_NFPM_VERSION}
+release: "1"
+section: utils
+priority: optional
+maintainer: Samuka007 <1309573889+Samuka007@users.noreply.github.com>
+description: |-
+  Rootless declarative sandbox sessions for Claude Code.
+  Egress pinning + locale override + CC config isolation via user-mode networking
+  (pasta primary, slirp4netns fallback, tun2proxy for socks5 form).
+vendor: iso-cc
+homepage: https://github.com/Samuka007/iso-cc
+license: MIT
+contents:
+  - src: packaging/dist/pkgroot/iso-cc
+    dst: /usr/bin/iso-cc
+depends:
+  - passt (>= 0.0~git20240220.1e6f92b)
+  - slirp4netns (>= 1.2.0)
+recommends:
+  - tun2proxy
+overrides:
+  deb:
+    # dpkg 版本串；顶层 depends 即 deb 语法，此处仅显式化存档。
+    depends:
+      - passt (>= 0.0~git20240220.1e6f92b)
+      - slirp4netns (>= 1.2.0)
+    recommends:
+      - tun2proxy
+  rpm:
+    # rpm 语义：passt 各发行版 EVR 方案不一（fedora 与 eln/centos stream 不同代），
+    # 钉下限反而制造假冲突 → passt 不钉版本；slirp4netns 用 rpm 关系语法。
+    depends:
+      - passt
+      - slirp4netns >= 1.2.0
+    recommends:
+      - tun2proxy
+  apk:
+    # apk 无弱依赖语义；alpine passt 版本方案（_git 后缀）无跨源可比基线，
+    # edge/3.20+ community 的 pasta 均含全部所需 flag → 不钉版本。
+    depends:
+      - passt
+      - slirp4netns>=1.2.0

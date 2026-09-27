@@ -69,9 +69,43 @@ pub(crate) fn version_output(bin: &Path) -> anyhow::Result<String> {
     Ok(v)
 }
 
-/// fail-loud #2（票 14 清单态，替换 09 期过渡态 which 解析）：provider 可执行从清单
-/// 钉定（绝对路径 + 版本登记）。清单缺失 / 条目缺失 / 路径不可执行 = Fail，
-/// 提示 setup；run/doctor 的会话上树一律消费钉定路径（稀疏 PATH 生效的前提）。
+/// helper 目录环境变量（工单 08 设计 #3，对标 podman `CONTAINERS_HELPER_BINARY_DIR`）：
+/// bundle 形态（tar.gz 解包后的 `libexec/`）无需 setup 即可解析 provider。
+pub const HELPER_DIR_ENV: &str = "ISO_CC_HELPER_DIR";
+
+/// provider 清单 key → 可接受的二进制名候选（env 目录与 PATH 两层共用）。
+fn bin_candidates(name: &str) -> Vec<&str> {
+    if name == crate::provider::socks::WORKER_KEY {
+        crate::provider::socks::BIN_CANDIDATES.to_vec()
+    } else {
+        vec![name]
+    }
+}
+
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// 第二层：`ISO_CC_HELPER_DIR` 指向的目录内按候选名找可执行。
+fn env_dir_bin(name: &str) -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os(HELPER_DIR_ENV)?);
+    bin_candidates(name).into_iter().find_map(|b| {
+        let cand = dir.join(b);
+        is_executable(&cand).then_some(cand)
+    })
+}
+
+/// provider 可执行解析门（工单 08 设计 #3 优先级链）：
+/// **manifest 钉路径 > `ISO_CC_HELPER_DIR` env > PATH**（对标 podman
+/// `CONTAINERS_HELPER_BINARY_DIR`；14 实现了首尾两层，08 补 env 层）。
+///
+/// - manifest 可读且有本 provider 条目 → 钉定路径唯一裁决：path 缺失（清单损坏）
+///   或不可执行 = Fail（漂移不静默穿透，提示 setup 收敛）；
+/// - 清单缺失（bundle 新装）或无本条目 → 依次落 env 目录、PATH；
+/// - 三层全空 = Fail：提示 setup / env 目录两条修复路径（仍无任何静默回落）。
+///
 /// gateway（pasta/slirp4netns）与 socks worker（tun2proxy）共用本门。
 pub fn pinned_bin(name: &str) -> anyhow::Result<PathBuf> {
     let manifest = crate::manifest::read().map_err(|e| {
@@ -80,32 +114,31 @@ pub fn pinned_bin(name: &str) -> anyhow::Result<PathBuf> {
             crate::manifest::manifest_path().display()
         )
     })?;
-    let Some(m) = manifest else {
-        anyhow::bail!(
-            "清单缺失（fail-loud #2）：provider {name} 绝对路径未钉定——先运行 `iso-cc setup`"
-        )
-    };
-    let entry = m
-        .find(crate::manifest::EntryKind::Provider, name)
-        .ok_or_else(|| {
-            anyhow!(
-                "清单无 {name} 条目（fail-loud #2）：未登记——先运行 `iso-cc setup --profile <n>`"
-            )
-        })?;
-    let path = entry
-        .path
-        .clone()
-        .ok_or_else(|| anyhow!("清单 {name} 条目缺 path（清单损坏）——重跑 `iso-cc setup` 收敛"))?;
-    let executable = std::fs::metadata(&path)
-        .map(|m| m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false);
-    if !executable {
-        anyhow::bail!(
-            "provider 钉定路径不可执行：{}（fail-loud #2）——重跑 `iso-cc setup` 收敛",
-            path.display()
-        );
+    if let Some(m) = manifest {
+        if let Some(entry) = m.find(crate::manifest::EntryKind::Provider, name) {
+            let path = entry.path.clone().ok_or_else(|| {
+                anyhow!("清单 {name} 条目缺 path（清单损坏）——重跑 `iso-cc setup` 收敛")
+            })?;
+            if !is_executable(&path) {
+                anyhow::bail!(
+                    "provider 钉定路径不可执行：{}（fail-loud #2）——重跑 `iso-cc setup` 收敛",
+                    path.display()
+                );
+            }
+            return Ok(path);
+        }
     }
-    Ok(path)
+    if let Some(path) = env_dir_bin(name) {
+        return Ok(path);
+    }
+    if let Some(path) = which_any(&bin_candidates(name)) {
+        return Ok(path);
+    }
+    anyhow::bail!(
+        "provider {name} 未解析（fail-loud #2）：优先级链 清单钉路径 > {HELPER_DIR_ENV} > PATH \
+         全部落空——先运行 `iso-cc setup`（发行版原生包形态），或设 {HELPER_DIR_ENV} 指向 \
+         bundle 解包目录的 libexec/（bundle 形态）"
+    )
 }
 
 /// gateway 形态的钉定路径（[`pinned_bin`] 的 NetGateway 便捷封装）。

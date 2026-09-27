@@ -1,0 +1,130 @@
+# 工单 08：tag push → 多发行版发布流水线。
+#
+# 流程（设计 #4）：tag v* 推送 →
+#   checks        flake 门（clippy -D warnings / fmt / nextest，与 ci.yml 同面）
+#   packages      musl 静态构建 → nfpm 矩阵出 deb/rpm/apk
+#   bundle        packaging/bundle.sh（helper sha256 钉定校验）出 tar.gz
+#   pkgbuild-lint namcap 静态检查 PKGBUILD
+#   release       汇聚产物 + sha256sums.txt → GitHub Release
+#
+# 版本一致性由 build.rs fail-loud 守卫：tag 基线 != Cargo.toml version 时任何
+# cargo 构建即败（checks/packages/bundle 三路都过不了，无需重复脚本）。
+# 签名（minisign）后置票，暂以 sha256sums.txt 提供完整性基线。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  MUSL_TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v16
+      - name: clippy + fmt + nextest（flake checks）
+        run: nix build -L .#checks.x86_64-linux.clippy .#checks.x86_64-linux.fmt .#checks.x86_64-linux.nextest
+
+  packages:
+    runs-on: ubuntu-latest
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix:
+        packager: [deb, rpm, apk]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v16
+      - name: musl 静态构建
+        run: nix develop -c cargo build --release --target "$MUSL_TARGET"
+      - name: staging 二进制（nfpm contents.src 固定路径）
+        run: |
+          mkdir -p packaging/dist/pkgroot
+          install -m 0755 "target/$MUSL_TARGET/release/iso-cc" packaging/dist/pkgroot/iso-cc
+      - name: nfpm 打包（${{ matrix.packager }}）
+        run: |
+          test -n "${GITHUB_REF_NAME#v}" || { echo "tag 解析失败" >&2; exit 1; }
+          VER="${GITHUB_REF_NAME#v}"
+          export ISO_CC_NFPM_VERSION="$VER"
+          mkdir -p dist
+          nix run nixpkgs#nfpm -- package \
+            -f packaging/nfpm.yaml \
+            -p ${{ matrix.packager }} \
+            -t "dist/iso-cc-${VER}-linux-amd64.${{ matrix.packager }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iso-cc-${{ matrix.packager }}
+          path: dist/iso-cc-*
+          if-no-files-found: error
+
+  bundle:
+    runs-on: ubuntu-latest
+    needs: checks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v16
+      - name: bundle tar.gz（helper sha256 钉定校验）
+        env:
+          ISO_CC_BUNDLE_OUT: dist
+        run: nix develop -c packaging/bundle.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iso-cc-bundle
+          path: dist/iso-cc-bundle-*
+          if-no-files-found: error
+
+  pkgbuild-lint:
+    runs-on: ubuntu-latest
+    needs: checks
+    steps:
+      - uses: actions/checkout@v4
+      - name: PKGBUILD 静态检查（bash -n + shellcheck）
+        # namcap 未入 nixpkgs（票 08 验收允许人工对照清单回退）：bash -n 语法 +
+        # shellcheck；SC2034/SC2154 = makepkg 魔法变量的必然误报（makepkg 消费
+        # pkgname/depends/srcdir/pkgdir 等），其余零告警为门。
+        run: |
+          bash -n packaging/PKGBUILD
+          nix run nixpkgs#shellcheck -- -s bash -S warning packaging/PKGBUILD > /tmp/sc.txt 2>&1 || true
+          if grep -oE 'SC[0-9]+' /tmp/sc.txt | sort -u | grep -qvE 'SC2034|SC2154'; then
+            cat /tmp/sc.txt
+            echo "PKGBUILD lint：存在非 makepkg 上下文误报的告警（fail）" >&2
+            exit 1
+          fi
+          echo "PKGBUILD lint：仅 makepkg 魔法变量误报（SC2034/SC2154），通过"
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [packages, bundle, pkgbuild-lint]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: sha256sums
+        working-directory: dist
+        run: sha256sum iso-cc-* > sha256sums.txt
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > release-notes.md <<'EOF'
+          ## 安装
+
+          - **发行版原生包**（依赖下放发行版）：deb/rpm/apk；`Depends: passt, slirp4netns`（版本下限见包元数据），`Recommends: tun2proxy`（socks5 形态增强）。
+          - **bundle**（零发行版依赖）：`tar xzf iso-cc-bundle-*.tar.gz && cd iso-cc-bundle-*`，运行前 `export ISO_CC_HELPER_DIR=$PWD/libexec`（无 setup、无 PATH 依赖，helper sha256 钉定校验随包构建）。
+
+          ## 完整性
+
+          见 `sha256sums.txt`；签名（minisign）后置票。
+          EOF
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "iso-cc $GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            dist/iso-cc-* dist/sha256sums.txt

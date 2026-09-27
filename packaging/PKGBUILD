@@ -1,0 +1,40 @@
+# Maintainer: Samuka007 <1309573889+Samuka007@users.noreply.github.com>
+# 工单 08：AUR 形态 PKGBUILD 模板（发行版原生包形态，arch 生态依赖下放）。
+#
+# 发版对照清单（打 v* tag 后执行，缺一不可）：
+#   1. bump Cargo.toml version == tag（build.rs fail-loud 守卫，不一致构建即败）
+#   2. updpkgsums 本文件（GitHub tag archive 的 sha256 因压缩实现不可本地预演，
+#      必须发版后以真实 archive 复算回填，SKIP 仅模板期占位）
+#   3. pkgver 同步为 tag 去 v 前缀值，pkgrel 归 1
+#   4. namcap packaging/PKGBUILD 零 error
+pkgname=iso-cc
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Rootless declarative sandbox sessions for Claude Code: egress pinning + locale override + CC config isolation"
+arch=('x86_64')
+url="https://github.com/Samuka007/iso-cc"
+license=('MIT')
+depends=('passt' 'slirp4netns')
+optdepends=('tun2proxy: socks5 egress 形态的 netns 内 worker（pacman/AUR 侧择一安装）')
+makedepends=('cargo')
+checkdepends=()
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+options=('!lto')  # cargo [profile.release] lto=fat 自管 LTO，禁 makepkg 注入
+
+build() {
+  cd "$pkgname-v$pkgver" || return 1
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo build --release --locked
+}
+
+check() {
+  cd "$pkgname-v$pkgver" || return 1
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo test --locked --release
+}
+
+package() {
+  cd "$pkgname-v$pkgver" || return 1
+  install -Dm0755 "$srcdir/target/release/iso-cc" "$pkgdir/usr/bin/iso-cc"
+}

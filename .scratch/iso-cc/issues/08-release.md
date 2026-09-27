@@ -2,7 +2,15 @@
 
 **What to build:** 自动化版本化 + 多发行版软件包。设计蓝本 = podman 模式（会话研究结论）：**核心单二进制 + 外部 helper 二进制按发行版生态协调**。
 
-**Blocked by:** 无（与 20 lane 文件集零交叉，可并行）　**Owner:** 待派
+**Blocked by:** 无　**Owner:** lane-package-release（完成）
+**Status:** done（2026-09-27，parent 亲验通过）
+
+## Answer（PM 落）
+
+- 六锚全绿 + parent 复验：nextest 141/141；deb 元数据经 nixpkgs#dpkg 核验（Version 0.1.0-1；Depends passt >= 0.0~git20240220.1e6f92b【passt.top 官方 noble 静态 deb 同版，10 flag 逐一比对】/ slirp4netns >= 1.2.0【使用面仅 -c】；Recommends tun2proxy）；bundle 解包稀疏 PATH + ISO_CC_HELPER_DIR=libexec e2e rc=0（helper 解析链 manifest>env>PATH 的 env 层独立承载，counterfactual 无 env fail-loud 不穿透）；`--version` 无 tag 回落 0.1.0（nix/crane 无 .git 构建不失败）
+- 版本注入实测：tag 副本 v0.1.0-1-g<hash>、-dirty 变体、tag/Cargo 不一致 panic rc=101（fail-loud）
+- workflow actionlint 1.7.12 零告警（act 本地不可跑，三 job 逐命令本地复现留档）；PKGBUILD bash -n OK（namcap 不在 nixpkgs，人工清单回退）
+- parent 复跑注记：NixOS 无 dpkg-deb（改用 nix dpkg）；稀疏 PATH 下 payload 需绝对路径（/usr/bin 无 true）——非缺陷，bundle 用户文档应注明
 
 ## 设计（来源：podman/passt 集成研究 + 本仓架构）
 
