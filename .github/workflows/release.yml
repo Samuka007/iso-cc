@@ -137,7 +137,7 @@ jobs:
     # - job 级 gate：secrets 未配置 → skip + ::warning::，job 绿。这同时覆盖
     #   aptline 仓尚未推送 GitHub 的窗口期（step 级 if 为 false 时 runner 不
     #   解析 uses，占位 slug 不会弄挂 release 流水线）；凭据到位即激活，
-    #   零改码（仅需把 APTLINE_OWNER 换成 aptline 实际 slug，唯一待替换点）。
+    #   零改码（APTLINE_OWNER 已替换为 Samuka007，2026-09-27）。
     # - action 内 ci-gate：通用消费者契约（见 aptline/action/action.yml）。
     # R2 三元组经 rclone env 注入（profile 名 r2，对应 --r2 r2:<bucket>）。
     runs-on: ubuntu-latest
@@ -160,7 +160,7 @@ jobs:
           fi
       - name: publish deb → APT registry (aptline)
         if: steps.gate.outputs.decision == 'publish'
-        uses: APTLINE_OWNER/aptline/action@v0
+        uses: Samuka007/aptline/action@v0
         with:
           component: iso-cc
           debs-glob: dist/iso-cc-*.deb
