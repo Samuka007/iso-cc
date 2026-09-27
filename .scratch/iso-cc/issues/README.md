@@ -57,6 +57,8 @@
 - nfpm.yaml 归邻居，但保留用户裁决的依赖降级（Depends 仅 passt；tun2proxy→Recommends；slirp4netns→Suggests）
 - 提案已投递待回执；回执后本表加邻位产出一行
 
+| 24 L15-stdio-MCP-grounding | ready（L1.5×stdio MCP 常驻链从未实测；@playwright/mcp 真负载逐跳 grounding） | — |
+
 ## 收尾态（2026-09-27）
 
 Agent 侧可做工作已全部完成（01-05、08-20 done）。剩余需外部输入：
