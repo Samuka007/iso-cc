@@ -25,7 +25,7 @@
 | 06 verify-matrix | in-progress | v0.2 子集绿（8 探针）；R12 子矩阵与 P16–P27 工具面待真实 cc 环境 |
 | 07 slirp4netns-fallback | done（吸收进 09 selfmap 入口） | 4090 全矩阵待跑 |
 | 08 release | ready | 全票合口后 |
-| D4 SOCKS 择型 | pending | pasta+tun2proxy vs embedded 自研并列实测（等 4090 隧道形态） |
+| 16 socks-form-tun2socks | done（2026-09-27 亲验） | D4 裁决=组合成立零自研；首个全绿 verify（P13 geo=SG）；embedded 降级远期 |
 | engine=mark 变体 | pending（触发条件未触发） | exec.bash=host 已解 US9 主诉求；cc 直spawn 进程的透明 localhost 残余缺口观察中 |
 
 ## 事件簿
