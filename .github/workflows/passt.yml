@@ -92,10 +92,10 @@ jobs:
           mkdir -p repo/pool/passt/i/passt repo/dists/stable/passt/binary-amd64 repo/dists/stable/main/binary-amd64
           cp passt_*.deb repo/pool/passt/i/passt/
           ( cd repo && apt-ftparchive packages pool/passt > dists/stable/passt/binary-amd64/Packages )
-          gzip -9n -k repo/dists/stable/passt/binary-amd64/Packages
+          gzip -9nc repo/dists/stable/passt/binary-amd64/Packages > repo/dists/stable/passt/binary-amd64/Packages.gz
           # main 组件索引从拉回的池重建（池为权威，dist 冗余重算无妨）
           ( cd repo && apt-ftparchive packages pool/main > dists/stable/main/binary-amd64/Packages )
-          gzip -9n -k repo/dists/stable/main/binary-amd64/Packages
+          gzip -9nc repo/dists/stable/main/binary-amd64/Packages > repo/dists/stable/main/binary-amd64/Packages.gz
           ( cd repo && apt-ftparchive -o "APT::FTPArchive::Release::Date=$(date -u +'%a, %d %b %Y %H:%M:%S UTC')" \
             -o APT::FTPArchive::Release::Origin=iso-cc \
             -o APT::FTPArchive::Release::Label=iso-cc \

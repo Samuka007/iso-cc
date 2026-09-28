@@ -160,7 +160,7 @@ jobs:
           mkdir -p repo/pool/main/i/iso-cc repo/dists/stable/main/binary-amd64 repo/dists/stable/passt/binary-amd64
           cp dist/iso-cc-*.deb repo/pool/main/i/iso-cc/
           ( cd repo && apt-ftparchive packages pool/main > dists/stable/main/binary-amd64/Packages )
-          gzip -9n -k repo/dists/stable/main/binary-amd64/Packages
+          gzip -9nc repo/dists/stable/main/binary-amd64/Packages > repo/dists/stable/main/binary-amd64/Packages.gz
           # passt 池（来自 passt.yml）如存在则重建其索引
           if [ -d repo/pool/passt ]; then
             ( cd repo && apt-ftparchive packages pool/passt > dists/stable/passt/binary-amd64/Packages )
