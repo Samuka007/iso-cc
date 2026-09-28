@@ -164,7 +164,7 @@ jobs:
           # passt 池（来自 passt.yml）如存在则重建其索引
           if [ -d repo/pool/passt ]; then
             ( cd repo && apt-ftparchive packages pool/passt > dists/stable/passt/binary-amd64/Packages )
-            gzip -9n -k repo/dists/stable/passt/binary-amd64/Packages
+            gzip -9nc repo/dists/stable/passt/binary-amd64/Packages > repo/dists/stable/passt/binary-amd64/Packages.gz
             COMPS="main passt"
           else
             COMPS="main"
