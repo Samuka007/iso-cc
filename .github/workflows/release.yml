@@ -151,6 +151,7 @@ jobs:
           GPG_PRIVATE_KEY: ${{ secrets.APTLINE_GPG_PRIVATE_KEY }}
         run: |
           set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone apt-utils >/dev/null
           [ -z "$APT_ACCOUNT_ID" ] && { echo "::warning::APT registry secrets 未配置，跳过发布"; exit 0; }
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
           KEY_ID=$(gpg --list-secret-keys --with-colons | grep '^fpr' | head -1 | cut -d: -f10)
