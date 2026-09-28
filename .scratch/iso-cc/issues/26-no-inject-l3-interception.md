@@ -2,7 +2,15 @@
 
 **What to build:** host 模式的拦截从「注入 L1.5 环境变量」改为「L3 mountns bind + 既有 L2」——cc 的会话 env 中不再出现任何点名 hook 的变量。动因（操作者 2026-09-28）：`CLAUDE_CODE_SHELL_PREFIX` 可被 cc 自身与任意子进程观测（env 是公开面），注入即自报拦截行为。
 
-**Blocked by:** 无（票 15/25 的 execstub/execrpc 底座已就位）　**Owner:** 邻居 agent（w12:p1，handoff 交接）
+**Blocked by:** 无　**Owner:** 邻居 agent（w12:p1，实现完成）
+**Status:** done（2026-09-28，parent 亲验；第 6 条 E1 重放待操作者放行 10001 实验场）
+
+## Answer（PM 落）
+
+- **验收 5/6 绿**（env 断言 / L3 stat 取证 / Bash+/bin/sh 双形态 / sandbox 回归 / clippy+nextest）+ parent 复跑：L3_exit7=7、L3_sh_exit9=9（双形态退出码直采）；netns 内 stat /bin/bash=76、/bin/sh=62（shim 符号链接尺寸）✓；nextest 142/142；clippy -D warnings 零告警
+- **操作者追加裁定三条（正本更新）**：①prefix/SHELL 值面 = 经典路径 /bin/bash（bind 后即 shim，cc 风控不可辨识）；②L2 全量种子撤（npx 类不可穷尽，stdio MCP 拦截改由值面经典路径承担——/bin/bash=shim 仍经单载荷转发宿主，E1 语义不变）；③PROXY 族 env scrub 防出口泄露
+- **parent 修复（L3 面回归）**：bind 列表无条件含 /usr/bin/bash → NixOS ENOENT → mountns 装配崩（-- /bin/true 复现）。修 = 存在性过滤 + skip note（对齐票 03 语义）；缺席路径天然不可执行，无拦截损失
+- **第 6 条（E1 重放）**：需 10001 重建实验场（node + claude 二进制 + 鉴权材料跨机）——等操作者放行
 
 ## 机制依据（票 24 源码级取证，字节偏移在 REPORT.md）
 

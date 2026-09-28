@@ -332,6 +332,13 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
     // 零 diff）。置于 redirect 之后 = 结构性拦截不被用户同名 redirect 覆盖。
     if let Some(ch) = &exec_channel {
         for dst in ["/bin/bash", "/usr/bin/bash", "/bin/sh"] {
+            // L3 bind 只对目标发行版真实存在的路径生效（NixOS 无 /usr/bin/bash；
+            // bind ENOENT 会让整个 mountns 装配失败）。缺席路径天然不可被执行，
+            // 无需拦截——跳过并留痕（对齐票 03 的 skip+note 语义）。
+            if !Path::new(dst).exists() {
+                eprintln!("[iso-cc] note: L3 拦截跳过 {dst}（宿主不存在该路径）");
+                continue;
+            }
             let base = dst.rsplit('/').next().expect("绝对路径必有 basename");
             binds.push((ch.bin_dir.join(base), dst.to_string()));
         }
