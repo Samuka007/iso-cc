@@ -102,7 +102,7 @@ jobs:
             -o APT::FTPArchive::Release::Suite=stable \
             -o APT::FTPArchive::Release::Codename=stable \
             -o APT::FTPArchive::Release::Architectures=amd64 \
-            -o APT::FTPArchive::Release::Components=main passt \
+            -o "APT::FTPArchive::Release::Components=main passt" \
             -o "APT::FTPArchive::Release::Description=iso-cc APT registry" \
             release dists/stable > dists/stable/Release )
           sed -i -E '/ [0-9]+ Release$/d' repo/dists/stable/Release
