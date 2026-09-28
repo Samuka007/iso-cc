@@ -222,11 +222,11 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
                 "10b. exec.bash=host: bash 调用经 <sessions/<id>/exec.sock> RPC 宿主侧 /bin/bash -c 执行（US9 真 localhost；bash 流量走宿主出口 = 显式声明的代价）".into(),
             );
             v.push(
-                "10b1. 拦截分层注入: L1.5 CLAUDE_CODE_SHELL_PREFIX + L1 SHELL + L2 PATH 前置 <sessions/<id>/bin> → multi-call shim（iso-cc 自身，argv0 basename=bash）"
+                "10b1. 拦截分层（票 26 去注入化，值面全经典路径）: L3 mountns bind /bin/bash、/usr/bin/bash、/bin/sh → 会话 shim + L1 SHELL=/bin/bash + CLAUDE_CODE_SHELL_PREFIX=/bin/bash（MCP 单载荷面；/bin/bash 经 bind 即 shim）→ multi-call shim（iso-cc 自身；argv0 basename=bash/sh = -c 转发，其余 = argv 直通）——cc 会话 env 零 <sess>/bin 路径暴露、零逐名 shim 种子"
                     .into(),
             );
             v.push(
-                "10b2. 覆盖面（ADR 0008 附 3 取证 + 通道实测）: Bash 工具/hooks/statusline/stdio MCP 经 L1.5 宿主执行；REPL !cmd 与 skill !cmd 硬编码 /bin/sh——L1/L2 不覆盖、L1.5 prefix 覆盖；WebSearch/WebFetch 无客户端 bash 面；完全 in-process 执行器无钩点（诚实边界）"
+                "10b2. 覆盖面（ADR 0008 附 3/附 4 取证 + 通道实测）: Bash 工具（$SHELL 与硬编码 /bin/bash 双形态）/hooks/statusline 经 L1+L3 宿主执行；stdio MCP 裸名 spawn（execvp npx）经 L2 argv 直通宿主执行；REPL !cmd 与 skill !cmd 硬编码 /bin/sh → L3 拦；WebSearch/WebFetch 无客户端 bash 面；完全 in-process 执行器无钩点（诚实边界）"
                     .into(),
             );
         }
@@ -330,7 +330,7 @@ mod tests {
         let joined = lines.join("\n");
         assert!(joined.contains("exec.bash=Host"), "{joined}");
         assert!(joined.contains("exec.sock"), "{joined}");
-        assert!(joined.contains("L1.5 CLAUDE_CODE_SHELL_PREFIX"), "{joined}");
+        assert!(joined.contains("L3 mountns bind /bin/bash"), "{joined}");
         assert!(joined.contains("multi-call shim"), "{joined}");
         // 两轴独立：scope 默认 tree 与 host 组合可见（变更（四）四组合之 tree+host）
         assert!(joined.contains("net.scope=Tree"), "{joined}");

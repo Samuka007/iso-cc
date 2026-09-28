@@ -8,8 +8,9 @@
 //! cc 的三种调用形态（ADR 0008 附 / 附 3 取证 + 官方 env-vars 文档）：
 //! - L1（`SHELL=<shim>`）：`$SHELL -c <整段脚本>` → `[shim, "-c", script]`
 //! - L2（PATH shim）：PATH 解析到 shim 的 `bash -c <script>` → 同上
-//! - L1.5（`CLAUDE_CODE_SHELL_PREFIX=<shim>`）：prefix 以「完整组装调用串」单载荷
-//!   传入（官方文档：命令行整体作为 $1）→ `[shim, "<invocation string>"]`
+//! - L1.5（`CLAUDE_CODE_SHELL_PREFIX=<shim>` 单载荷）：票 26 取消注入；parse_script
+//!   的单载荷分支保留为容错形态（用户手跑 shim + 引号串仍可解析转发）
+//! - 票 26 增 argv 直通：argv0 basename ∉ {bash, sh} → 宿主 execvp 原 argv
 //!
 //! fail-loud 纪律：任何通道失败 = stderr 报告 + 退出 126，绝不回落本地 bash
 //! （fail-open 会静默破坏 `exec.bash=host` 的声明语义）。
@@ -20,14 +21,39 @@ use std::io::Write as _;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-/// multi-call 判别键（附 2：argv0 basename == `bash` → 转发模式）。
-pub const STUB_BASENAME: &str = "bash";
+/// multi-call 判别键（附 2 + 票 26：argv0 basename ∈ {`bash`, `sh`} → shell 转发；
+/// 其余 shim 名 → argv 直通；`iso-cc` 本名 → CLI）。
+pub const STUB_BASENAMES: [&str; 2] = ["bash", "sh"];
+
+/// 调用形态三分（票 26 spec#3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StubKind {
+    /// iso-cc 本名调用 = CLI 主流程。
+    Cli,
+    /// shell 形态（bash/sh）：`-c` 脚本解析 + 宿主 `HOST_SHELL -c` 执行。
+    Shell,
+    /// argv 直通形态：宿主侧按原 argv execvp（宿主 PATH 解析）。
+    Argv,
+}
+
+pub fn classify(argv0: Option<&OsStr>) -> StubKind {
+    let Some(a) = argv0 else {
+        return StubKind::Cli;
+    };
+    let Some(base) = Path::new(a).file_name().map(|b| b.to_os_string()) else {
+        return StubKind::Cli;
+    };
+    if base == *"iso-cc" {
+        return StubKind::Cli;
+    }
+    if STUB_BASENAMES.iter().any(|b| OsStr::new(*b) == base) {
+        return StubKind::Shell;
+    }
+    StubKind::Argv
+}
 
 pub fn is_stub_invocation(argv0: Option<&OsStr>) -> bool {
-    match argv0 {
-        Some(a) => Path::new(a).file_name().is_some_and(|b| b == STUB_BASENAME),
-        None => false,
-    }
+    classify(argv0) != StubKind::Cli
 }
 
 /// 从 argv（已去 argv0）解析转发脚本。见模块注释的三形态；`-c` 后容 flag 段
@@ -72,6 +98,11 @@ pub fn forward() -> ! {
     std::process::exit(forward_code())
 }
 
+/// argv 直通模式主体（票 26 spec#3）：不返回（exit）。
+pub fn forward_argv() -> ! {
+    std::process::exit(forward_code_argv())
+}
+
 fn err126(msg: &str) -> i32 {
     let _ = std::io::stderr().write_all(format!("[iso-cc exec stub] {msg}\n").as_bytes());
     126
@@ -98,6 +129,7 @@ fn forward_code() -> i32 {
         cwd: cwd.to_string_lossy().into_owned(),
         // v1 恒空表：env 策略归 server（宿主基底 + locale 注入，ADR 附）。
         env: Default::default(),
+        argv: None,
     };
     let mut stream = match UnixStream::connect(&sock) {
         Ok(s) => s,
@@ -123,6 +155,49 @@ fn forward_code() -> i32 {
     }
 }
 
+fn forward_code_argv() -> i32 {
+    let Some(sock) = std::env::var_os("ISO_CC_EXEC_SOCK") else {
+        return err126(
+            "ISO_CC_EXEC_SOCK 未设置——argv 直通 shim 在无 exec 通道的上下文中被调用（配置与注入不一致）",
+        );
+    };
+    let argv: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err126(&format!("cwd 不可解析: {e}")),
+    };
+    let req = ExecRequest {
+        script: String::new(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        env: Default::default(),
+        argv: Some(argv),
+    };
+    let mut stream = match UnixStream::connect(Path::new(&sock)) {
+        Ok(s) => s,
+        Err(e) => {
+            return err126(&format!(
+                "连 exec.sock 失败（{}）: {e}",
+                Path::new(&sock).display()
+            ))
+        }
+    };
+    if let Err(e) = send_request(&stream, &req, &[0, 1, 2]) {
+        return err126(&format!("发送请求失败: {e}"));
+    }
+    let resp = match read_frame(&mut stream) {
+        Ok(r) => r,
+        Err(e) => return err126(&format!("读取响应失败: {e}")),
+    };
+    match resp {
+        ExecResponse::Code { code } => code,
+        ExecResponse::Signal { signal } => 128 + signal,
+        ExecResponse::Error { error } => err126(&error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,14 +208,24 @@ mod tests {
 
     #[test]
     fn argv0_basename_discriminates() {
-        assert!(is_stub_invocation(Some(
-            "/x/.local/state/iso-cc/sessions/s1/bin/bash".as_ref()
-        )));
-        assert!(is_stub_invocation(Some("/x/shims/bash".as_ref())));
-        assert!(is_stub_invocation(Some("/usr/bin/bash".as_ref())));
-        assert!(!is_stub_invocation(Some("/x/target/debug/iso-cc".as_ref())));
-        assert!(!is_stub_invocation(Some("bashful".as_ref())));
-        assert!(!is_stub_invocation(None));
+        // shell 形态（-c 解析转发）
+        assert_eq!(
+            classify(Some("/x/.local/state/iso-cc/sessions/s1/bin/bash".as_ref())),
+            StubKind::Shell
+        );
+        assert_eq!(classify(Some("/usr/bin/sh".as_ref())), StubKind::Shell);
+        // argv 直通形态（票 26：bashful/npx 一类非 bash/sh shim 名）
+        assert_eq!(classify(Some("bashful".as_ref())), StubKind::Argv);
+        assert_eq!(
+            classify(Some("/x/.local/state/iso-cc/sessions/s1/bin/npx".as_ref())),
+            StubKind::Argv
+        );
+        // 本名 = CLI；无 argv0 = CLI（保守：不进 stub 面）
+        assert_eq!(
+            classify(Some("/x/target/debug/iso-cc".as_ref())),
+            StubKind::Cli
+        );
+        assert_eq!(classify(None), StubKind::Cli);
     }
 
     #[test]

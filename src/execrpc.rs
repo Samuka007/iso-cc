@@ -58,6 +58,11 @@ pub struct ExecRequest {
     /// locale 注入，ADR 附）；字段按协议正本保留，供未来 per-call 覆盖。
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// argv 直通模式（票 26 spec#3）：`Some(argv)` = 宿主侧按原 argv execvp（宿主
+    /// PATH 解析；首元素 = 程序名）。`None` = 正本 `HOST_SHELL -c script`。stub 的
+    /// shell 形态（argv0 ∈ {bash, sh}）恒 `None`。同 binary 同 wire，无跨版本面。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
 }
 
 /// 响应：退出码 | 致命信号 | 通道错误。internally-tagged（`{"status":"code","code":7}`）：
@@ -154,7 +159,8 @@ struct WorkerSpec {
 /// 已装配未启动的通道（spawn 早期调用 [`prepare`]，网关 spawn 成功后调
 /// [`ExecChannel::serve`]）。
 pub struct ExecChannel {
-    /// L1/L1.5 注入的 shell 路径 = `<sess>/bin/bash`（multi-call shim 符号链接 → iso-cc）。
+    /// L1/L1.5 注入的 shell 路径 = `<sess>/bin/bash`（multi-call shim 符号链接 →
+    /// iso-cc；票 26 起 env 值面恒写经典路径 `/bin/bash`，经 L3 bind 即本 shim）。
     pub shell_path: PathBuf,
     /// L2 PATH shim 目录 = `<sess>/bin`。
     pub bin_dir: PathBuf,
@@ -210,6 +216,20 @@ pub fn prepare(
             )
         })?;
     }
+    // 票 26：`sh` 同 shim（hooks/REPL 硬编码 /bin/sh → L3 bind 面）。
+    let sh_path = bin_dir.join("sh");
+    let shim_src = if cross_uid {
+        crate::mark::ensure_shim_binary()?
+    } else {
+        exe.clone()
+    };
+    std::os::unix::fs::symlink(&shim_src, &sh_path).with_context(|| {
+        format!(
+            "创建 multi-call shim 符号链接 {} -> {}",
+            sh_path.display(),
+            shim_src.display()
+        )
+    })?;
     let sock_path = sess_dir.join("exec.sock");
     // 防御性清理（同 id 重跑不发生——id 含纳秒；崩溃残留交 13 sweep）。
     let _ = std::fs::remove_file(&sock_path);
@@ -322,11 +342,22 @@ fn handle_conn(mut stream: UnixStream, spec: Arc<WorkerSpec>, registry: Arc<Mute
         return;
     }
 
+    // 票 26：argv 直通（Some(argv)）= 宿主 PATH execvp 原形态；None = 正本
+    // `HOST_SHELL -c script`（shell 形态，票 15 spec#1）。
     let shell = host_shell();
-    let mut cmd = std::process::Command::new(&shell);
-    cmd.arg("-c")
-        .arg(&req.script)
-        .current_dir(&req.cwd)
+    let mut cmd = match &req.argv {
+        Some(argv) if !argv.is_empty() => {
+            let mut c = std::process::Command::new(&argv[0]);
+            c.args(&argv[1..]);
+            c
+        }
+        _ => {
+            let mut c = std::process::Command::new(&shell);
+            c.arg("-c").arg(&req.script);
+            c
+        }
+    };
+    cmd.current_dir(&req.cwd)
         // stdio 由 pre_exec dup2 接管（fd 所有权随闭包存活至 exec）
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -521,6 +552,7 @@ mod tests {
             script: "echo hi".into(),
             cwd: "/tmp".into(),
             env: Default::default(),
+            argv: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"script\":\"echo hi\""), "{json}");
@@ -618,6 +650,7 @@ mod tests {
             script: "echo chan-ok; exit 7".into(),
             cwd: dir.path().to_string_lossy().into_owned(),
             env: Default::default(),
+            argv: None,
         };
         let mut conn = UnixStream::connect(&sock_path).expect("connect");
         send_request(&conn, &req, &fds).expect("send_request");
@@ -637,6 +670,7 @@ mod tests {
             script: "pwd; echo TZ=$TZ".into(),
             cwd: dir.path().to_string_lossy().into_owned(),
             env: Default::default(),
+            argv: None,
         };
         let mut conn2 = UnixStream::connect(&sock_path).expect("connect2");
         send_request(&conn2, &req2, &fds).expect("send2");
@@ -653,6 +687,7 @@ mod tests {
             script: "true".into(),
             cwd: "/nonexistent-iso-cc-t15".into(),
             env: Default::default(),
+            argv: None,
         };
         let mut conn3 = UnixStream::connect(&sock_path).expect("connect3");
         send_request(&conn3, &req3, &fds).expect("send3");
@@ -690,6 +725,7 @@ mod tests {
             script: "sleep 30".into(),
             cwd: dir.path().to_string_lossy().into_owned(),
             env: Default::default(),
+            argv: None,
         };
         let conn = UnixStream::connect(&sock_path).expect("connect");
         send_request(&conn, &req, &fds).expect("send");

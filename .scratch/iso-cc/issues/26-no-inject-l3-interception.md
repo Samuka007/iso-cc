@@ -31,3 +31,48 @@
 ## 边界
 
 - 不改 `.scratch/**`、`docs/**`；不 git；一次验证收尾；ISO_CC_* env 的路径推导去 env 化留后续票
+
+
+---
+
+# 附：交接底稿（/tmp/iso-cc-handoff-ticket26.md 迁入防丢，2026-09-28）
+# Handoff：iso-cc 票 26 —— 拦截去注入化（L3 bind + L2）
+
+写给：w12:p1（iso-cc 打包/发行面 agent），当前任务收尾后接本票实现。
+日期：2026-09-28 · 交接人：w12:p2（主 tracker 维护者）
+
+## 任务一句话
+
+host 模式的 shell/MCP 拦截从「注入 CLAUDE_CODE_SHELL_PREFIX」改为「mountns bind /bin/bash、/usr/bin/bash、/bin/sh → 会话 shim + PATH 前置」——cc 会话 env 零新增 hook 点名变量。
+
+## 你需要读的正本（按序，勿凭记忆）
+
+1. `.scratch/iso-cc/issues/26-no-inject-l3-interception.md` —— 验收锚与 Specification（本票唯一事实源）
+2. `docs/adr/0008-net-scope-declaration.md` 附 4 —— 决策与理由（L1.5 取消）
+3. `/tmp/iso-cc-exp24/REPORT.md` —— 票 24 实测：stdio MCP spawn = execvp 裸名 npx（L2 可拦）；E1 全链形态；E5 = 你要修的 126 复现
+4. `src/execstub.rs` 现状 —— 25 已修 -l 容忍与二跳 sock 注入，在此基础上加 argv 直通模式
+
+## 实施要点（浓缩）
+
+- 删：session env 注入 `CLAUDE_CODE_SHELL_PREFIX`（host 模式）
+- 增：netns 内 mountns bind `/bin/bash`、`/usr/bin/bash`、`/bin/sh` → `<sess>/bin/<name>`（multi-call shim 符号链接；注意 bind 后 bootstrap 自身不得再调 /bin/sh——现 bootstrap 已无 shell 依赖，验证即可）
+- 增：execstub argv 直通模式——argv0 basename ∉ {bash, sh} 时宿主侧按原 argv execvp（宿主 PATH 解析真 npx），长生命周期（SCM_RIGHTS 通道，24 E1/E2 已证）
+- 保留：L1 SHELL、L2 PATH 前置、ISO_CC_SESSION / ISO_CC_EXEC_SOCK env（去 env 化留后续票）
+- sandbox 模式零变化（回归锚）
+
+## 建议技能（Skill tool）
+
+- `skill://herdr` —— 你需要与我（w12:p2）协调分支/提交时序
+- `skill://tdd` —— 红绿顺序：先写 env 断言与 L3 取证测试（红），再实现
+
+## 验收（完整版见票 26，此为速查）
+
+env 无 CLAUDE_CODE_SHELL_PREFIX ｜ L3 bind exe 取证 ｜ 真 @playwright/mcp 全链不回归 ｜ Bash/hooks/statusline 三面绿 ｜ sandbox 不回归 ｜ clippy+nextest 全绿
+
+## 边界
+
+`.scratch/**`、`docs/**` 只读（主 tracker 归 w12:p2）；不 git（parent 统一提交）；一次验证收尾。
+
+## 交接背景（30 秒版）
+
+iso-cc = rootless 声明式沙箱（双引擎 netns/mark，正本 docs/REQUIREMENTS.md）。host 模式下我们把 cc 的 shell/MCP 执行转发到宿主侧（exec.sock RPC，SCM_RIGHTS stdio 直通，长生命周期已实测）。现有拦截靠注入 `CLAUDE_CODE_SHELL_PREFIX`（L1.5）+ SHELL（L1）+ PATH（L2）——操作者裁定注入可观测、取消，改 bind 方案。真 @playwright/mcp 全链已在票 24 实测通过（你的前提是信任该证据，无需重跑阶段 1）。

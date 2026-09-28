@@ -327,6 +327,15 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
         ExecBash::Host => Some(execrpc::prepare(&sess_dir, profile, &session_id, false)?),
         ExecBash::Sandbox => None,
     };
+    // 票 26 L3：netns 内 mountns bind /bin/bash、/usr/bin/bash、/bin/sh → 会话 shim
+    //（bind 源 = shim 符号链接，mount(2) 解析至 iso-cc 自身；mountns 作用域，宿主
+    // 零 diff）。置于 redirect 之后 = 结构性拦截不被用户同名 redirect 覆盖。
+    if let Some(ch) = &exec_channel {
+        for dst in ["/bin/bash", "/usr/bin/bash", "/bin/sh"] {
+            let base = dst.rsplit('/').next().expect("绝对路径必有 basename");
+            binds.push((ch.bin_dir.join(base), dst.to_string()));
+        }
+    }
 
     // bootstrap plan（§1.4）：mode 位承载 provider 差异（§1.2 被否双模式并存的收敛点）
     let has_socks = socks_plan.is_some();
@@ -941,9 +950,11 @@ fn session_dir(session_id: &str) -> anyhow::Result<PathBuf> {
 /// TZ/LANG/显式 env 与 CLAUDE_CONFIG_DIR 摘除。调用对象 = 会话 env 的传播点：
 /// pasta（spawn 模式，经 env 链传至 bootstrap/cc）或 bootstrap（slirp 模式）。
 /// ISO_CC_SESSION 双标记不在此：pasta/slirp 由 Command::env 注入，bootstrap 自设（§1.4）。
-/// `exec=Some`（exec.bash=host，票 15）叠加拦截分层注入：L1.5 `CLAUDE_CODE_SHELL_PREFIX`
-/// （附 3 取证覆盖 Bash 工具/hooks/statusline/stdio MCP）+ L1 `SHELL`（fallback 面）+
-/// L2 PATH 前置 shim 目录 + `ISO_CC_EXEC_SOCK` 通道指针。
+/// `exec=Some`（exec.bash=host，票 15）叠加拦截：L3 mountns bind /bin/bash、
+/// /usr/bin/bash、/bin/sh → 会话 shim（经典路径，值面不可辨识）+ L1 `SHELL =
+/// /bin/bash`（同 shim）+ `CLAUDE_CODE_SHELL_PREFIX = /bin/bash`（MCP 单载荷
+/// 面，值 = 经典路径）+ `ISO_CC_EXEC_SOCK` 通道指针。无 `<sess>/bin` PATH
+/// 暴露、无逐名 shim 种子（npx 类不可穷尽——操作者裁定 2026-09-28）。
 fn apply_env(cmd: &mut Command, profile: &Profile, exec: Option<&execrpc::ExecChannel>) {
     if let Some(tz) = &profile.locale.tz {
         cmd.env("TZ", tz);
@@ -964,17 +975,10 @@ fn apply_env(cmd: &mut Command, profile: &Profile, exec: Option<&execrpc::ExecCh
     // 防宿主 CLAUDE_CONFIG_DIR 泄漏进会话（R4）
     cmd.env_remove("CLAUDE_CONFIG_DIR");
     if let Some(ch) = exec {
-        cmd.env("CLAUDE_CODE_SHELL_PREFIX", &ch.shell_path);
-        cmd.env("SHELL", &ch.shell_path);
+        // 值面全部经典路径：/bin/bash 经 L3 bind 即会话 shim（票 26）。
+        cmd.env("SHELL", "/bin/bash");
+        cmd.env("CLAUDE_CODE_SHELL_PREFIX", "/bin/bash");
         cmd.env("ISO_CC_EXEC_SOCK", &ch.sock_path);
-        // L2：PATH 前置 shim 目录（目录内仅 `bash` 一键；宿主 worker PATH = 宿主基底，
-        // 不受此影响——env 策略 server 侧，execrpc::worker_env_vars）。
-        if let Some(p) = std::env::var_os("PATH") {
-            let mut new_path = OsString::from(ch.bin_dir.as_os_str());
-            new_path.push(":");
-            new_path.push(&p);
-            cmd.env("PATH", new_path);
-        }
     }
 }
 

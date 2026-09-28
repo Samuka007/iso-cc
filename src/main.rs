@@ -125,10 +125,13 @@ enum Commands {
 }
 
 fn main() {
-    // multi-call stub 分派（票 15 / ADR 0008 附 2）：argv0 basename == "bash" = 转发
-    // 模式（L1 SHELL / L1.5 prefix / L2 PATH shim 三种调用形态共用同一入口；不返回）。
-    if execstub::is_stub_invocation(std::env::args_os().next().as_deref()) {
-        execstub::forward();
+    // multi-call stub 分派（票 15 / 票 26 / ADR 0008 附 2+4）：argv0 basename ∈
+    // {bash, sh} = shell 转发；其余 shim 名（手制 shim 或非常规命名）= argv 直通；
+    // iso-cc 本名 = CLI（三种调用形态共用同一入口；不返回）。
+    match execstub::classify(std::env::args_os().next().as_deref()) {
+        execstub::StubKind::Cli => {}
+        execstub::StubKind::Shell => execstub::forward(),
+        execstub::StubKind::Argv => execstub::forward_argv(),
     }
     if let Err(e) = run() {
         eprintln!("error: {e:#}");
