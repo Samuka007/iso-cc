@@ -25,6 +25,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container: ubuntu:22.04
+    defaults:
+      run:
+        shell: bash
     env:
       PASST_TAG: ${{ inputs.passt_tag || '2024_02_20.1e6f92b' }}
     steps:
