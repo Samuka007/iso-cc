@@ -158,7 +158,7 @@ jobs:
           mkdir -p pool/main/i/iso-cc dists/stable/main/binary-amd64
           cp dist/iso-cc-*.deb pool/main/i/iso-cc/
           apt-ftparchive packages pool > dists/stable/main/binary-amd64/Packages
-          gzip -9n dists/stable/main/binary-amd64/Packages
+          gzip -9n -k dists/stable/main/binary-amd64/Packages
           apt-ftparchive -o "APT::FTPArchive::Release::Date=$(date -u +'%a, %d %b %Y %H:%M:%S UTC')" \
             -o APT::FTPArchive::Release::Origin=iso-cc \
             -o APT::FTPArchive::Release::Label=iso-cc \
@@ -168,12 +168,10 @@ jobs:
             -o APT::FTPArchive::Release::Components=main \
             -o "APT::FTPArchive::Release::Description=iso-cc APT registry" \
             release dists/stable > dists/stable/Release
-          # apt (2.4 jammy & 2.7 noble verified) silently drops ALL index targets when
-          # SHA1/SHA256/SHA512 sections are present in Release; MD5Sum-only yields targets.
-          # Integrity is guaranteed by the GPG signature over the whole file.
-          # drop the self-referential 'Release' hash entry: ftparchive hashes its own
-          # header mid-write (167B) but the final file differs, and apt silently drops
-          # the whole repo on meta-file hash mismatch (verified jammy 2.4 + noble 2.7)
+          # keep BOTH Packages and Packages.gz advertised: apt resolves the UNCOMPRESSED
+          # MetaKey (main/binary-amd64/Packages) in the Release hash table; gzip-deleting
+          # the plain file made apt silently drop the entire repo (root cause of the
+          # target-less updates). ftparchive then hashes both entries with correct sums.
           sed -i -E '/ [0-9]+ Release$/d' dists/stable/Release
           gpg --batch --yes --clearsign --output dists/stable/InRelease dists/stable/Release
           gpg --batch --yes --armor --detach-sign --output dists/stable/Release.gpg dists/stable/Release
