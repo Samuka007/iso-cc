@@ -368,8 +368,21 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_default_plan_states_equivalence() {
+    fn host_default_plan_declares_rpc_channel() {
         let p = prof("egress = 'if:wg0'");
+        let lines = plan_lines("x", &p, None);
+        let joined = lines.join("\n");
+        assert!(joined.contains("exec.bash=Host"), "{joined}");
+        assert!(joined.contains("exec.sock"), "{joined}");
+        assert!(
+            !joined.contains("行为与现状等价"),
+            "默认已翻 Host，等价语义仅显式 sandbox 声明: {joined}"
+        );
+    }
+
+    #[test]
+    fn explicit_sandbox_plan_states_equivalence() {
+        let p = prof("egress = 'if:wg0'\nexec.bash = 'sandbox'");
         let lines = plan_lines("x", &p, None);
         let joined = lines.join("\n");
         assert!(joined.contains("exec.bash=Sandbox"), "{joined}");

@@ -147,9 +147,8 @@ pub struct Profile {
     pub env: BTreeMap<String, String>,
 }
 
-/// `exec.bash` 声明（票 15）：`sandbox`（默认，bash 工具会话内执行，行为与现状等价）
-/// | `host`（经 exec.sock RPC 通道宿主侧执行，US9 真 localhost；身份一致性让位 =
-/// 显式声明的代价，spec 变更（四））。
+/// `exec.bash` 声明（票 15）：`host`（默认，经 exec.sock RPC 通道宿主侧执行，US9 真
+/// localhost）| `sandbox`（bash 工具留在会话内执行，继承会话路由面；用户裁决 2026-09-28）。
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecBash {
@@ -396,7 +395,7 @@ impl Profile {
 
     /// 生效 bash 执行位置（未声明 = sandbox，行为与现状等价）。
     pub fn exec_bash(&self) -> ExecBash {
-        self.exec.bash.unwrap_or(ExecBash::Sandbox)
+        self.exec.bash.unwrap_or(ExecBash::Host)
     }
 
     /// 生效 CC 配置隔离（未声明 = true，票 05 默认内置重定向对）。
@@ -726,9 +725,9 @@ agent.command = "claude"
     }
 
     #[test]
-    fn exec_bash_defaults_to_sandbox() {
+    fn exec_bash_defaults_to_host() {
         let cfg: Config = toml::from_str("version = 1\n[profile.x]\negress = 'if:wg0'").unwrap();
-        assert_eq!(cfg.profile.get("x").unwrap().exec_bash(), ExecBash::Sandbox);
+        assert_eq!(cfg.profile.get("x").unwrap().exec_bash(), ExecBash::Host);
     }
 
     #[test]
