@@ -155,12 +155,12 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone apt-utils >/dev/null
           [ -z "$APT_ACCOUNT_ID" ] && { echo "::warning::APT registry secrets 未配置，跳过发布"; exit 0; }
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          KEY_ID=$(gpg --list-secret-keys --with-colons | grep '^fpr' | head -1 | cut -d: -f10)
           mkdir -p pool/main/i/iso-cc dists/stable/main/binary-amd64
           cp dist/iso-cc-*.deb pool/main/i/iso-cc/
           apt-ftparchive packages pool > dists/stable/main/binary-amd64/Packages
           gzip -9n dists/stable/main/binary-amd64/Packages
-          apt-ftparchive -o APT::FTPArchive::Release::Origin=iso-cc \
+          apt-ftparchive -o "APT::FTPArchive::Release::Date=$(date -u +'%a, %d %b %Y %H:%M:%S UTC')" \
+            -o APT::FTPArchive::Release::Origin=iso-cc \
             -o APT::FTPArchive::Release::Label=iso-cc \
             -o APT::FTPArchive::Release::Suite=stable \
             -o APT::FTPArchive::Release::Codename=stable \
