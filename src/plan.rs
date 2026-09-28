@@ -135,7 +135,9 @@ pub fn plan_lines(profile_name: &str, p: &Profile, command: Option<&OsString>) -
     }
     // 票 05（R4/D6）：内置对展开可见——rw bind backing（profile 持久态）→ view（cc 默认路径）
     if mark && p.cc_isolation() {
-        let backing0 = crate::mark::cc_builtin_pairs_mark(profile_name)[0].backing.clone();
+        let backing0 = crate::mark::cc_builtin_pairs_mark(profile_name)[0]
+            .backing
+            .clone();
         v.push(
             format!(
                 "4c. cc_isolation=true (mark form, 票 18): HOME rewritten to {}（uid DAC 属主）→ cc 无感走默认 ~/.claude 路径；宿主 ~/.claude 对 uid 4210 DAC 不可达；CLAUDE_CONFIG_DIR unset",

@@ -260,7 +260,10 @@ fn session_dir_names() -> Vec<String> {
     .flatten()
     {
         if let Ok(rd) = std::fs::read_dir(&root) {
-            names.extend(rd.flatten().filter_map(|e| e.file_name().into_string().ok()));
+            names.extend(
+                rd.flatten()
+                    .filter_map(|e| e.file_name().into_string().ok()),
+            );
         }
     }
     names.into_iter().collect()

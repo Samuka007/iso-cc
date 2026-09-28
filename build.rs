@@ -17,8 +17,7 @@
 use std::process::Command;
 
 fn main() {
-    let pkg_version = std::env::var("CARGO_PKG_VERSION")
-        .expect("cargo 恒注入 CARGO_PKG_VERSION");
+    let pkg_version = std::env::var("CARGO_PKG_VERSION").expect("cargo 恒注入 CARGO_PKG_VERSION");
     match git_describe() {
         Some(desc) => {
             // describe 形态：vX.Y.Z / vX.Y.Z-N-g<hash> / 尾缀 -dirty。

@@ -330,12 +330,11 @@ pub fn run(declared_tz: &str, allow_under: &[PathBuf]) -> Vec<Probe> {
             ));
         } else {
             for port in ports {
-                let reachable =
-                    std::net::TcpStream::connect_timeout(
-                        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-                        std::time::Duration::from_secs(1),
-                    )
-                    .is_ok();
+                let reachable = std::net::TcpStream::connect_timeout(
+                    &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                    std::time::Duration::from_secs(1),
+                )
+                .is_ok();
                 let (verdict, detail) = if reachable {
                     mcp_classify(true)
                 } else {

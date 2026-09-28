@@ -171,7 +171,10 @@ mod tests {
             "无 snapshot 形态：-c <script>"
         );
         // flag 段可多枚；段后多脚本参数仍 fail-loud
-        assert_eq!(parse_script(&os(&["-c", "-l", "-l", payload])).unwrap(), payload);
+        assert_eq!(
+            parse_script(&os(&["-c", "-l", "-l", payload])).unwrap(),
+            payload
+        );
         assert!(
             parse_script(&os(&["-c", "-l", "a", "b"])).is_err(),
             "flag 段后多脚本参数 = Err（fail-loud 保持）"
