@@ -155,25 +155,35 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq rclone apt-utils >/dev/null
           [ -z "$APT_ACCOUNT_ID" ] && { echo "::warning::APT registry secrets 未配置，跳过发布"; exit 0; }
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          mkdir -p pool/main/i/iso-cc dists/stable/main/binary-amd64
-          cp dist/iso-cc-*.deb pool/main/i/iso-cc/
-          apt-ftparchive packages pool > dists/stable/main/binary-amd64/Packages
-          gzip -9n -k dists/stable/main/binary-amd64/Packages
-          apt-ftparchive -o "APT::FTPArchive::Release::Date=$(date -u +'%a, %d %b %Y %H:%M:%S UTC')" \
+          # 增量合并：拉现有 registry（含 passt 组件池）→ 补 pool → 全量重建 → 重签
+          rclone copy r2:apt repo --transfers 4
+          mkdir -p repo/pool/main/i/iso-cc repo/dists/stable/main/binary-amd64 repo/dists/stable/passt/binary-amd64
+          cp dist/iso-cc-*.deb repo/pool/main/i/iso-cc/
+          ( cd repo && apt-ftparchive packages pool/main > dists/stable/main/binary-amd64/Packages )
+          gzip -9n -k repo/dists/stable/main/binary-amd64/Packages
+          # passt 池（来自 passt.yml）如存在则重建其索引
+          if [ -d repo/pool/passt ]; then
+            ( cd repo && apt-ftparchive packages pool/passt > dists/stable/passt/binary-amd64/Packages )
+            gzip -9n -k repo/dists/stable/passt/binary-amd64/Packages
+            COMPS="main passt"
+          else
+            COMPS="main"
+          fi
+          ( cd repo && apt-ftparchive -o "APT::FTPArchive::Release::Date=$(date -u +'%a, %d %b %Y %H:%M:%S UTC')" \
             -o APT::FTPArchive::Release::Origin=iso-cc \
             -o APT::FTPArchive::Release::Label=iso-cc \
             -o APT::FTPArchive::Release::Suite=stable \
             -o APT::FTPArchive::Release::Codename=stable \
             -o APT::FTPArchive::Release::Architectures=amd64 \
-            -o APT::FTPArchive::Release::Components=main \
+            -o APT::FTPArchive::Release::Components="$COMPS" \
             -o "APT::FTPArchive::Release::Description=iso-cc APT registry" \
-            release dists/stable > dists/stable/Release
+            release dists/stable > dists/stable/Release )
           # keep BOTH Packages and Packages.gz advertised: apt resolves the UNCOMPRESSED
           # MetaKey (main/binary-amd64/Packages) in the Release hash table; gzip-deleting
           # the plain file made apt silently drop the entire repo (root cause of the
           # target-less updates). ftparchive then hashes both entries with correct sums.
-          sed -i -E '/ [0-9]+ Release$/d' dists/stable/Release
-          gpg --batch --yes --clearsign --output dists/stable/InRelease dists/stable/Release
-          gpg --batch --yes --armor --detach-sign --output dists/stable/Release.gpg dists/stable/Release
-          rclone copy dists r2:apt/dists --transfers 4
-          rclone copy pool r2:apt/pool --transfers 4
+          sed -i -E '/ [0-9]+ Release$/d' repo/dists/stable/Release
+          gpg --batch --yes --clearsign --output repo/dists/stable/InRelease repo/dists/stable/Release
+          gpg --batch --yes --armor --detach-sign --output repo/dists/stable/Release.gpg repo/dists/stable/Release
+          rclone copy repo/dists r2:apt/dists --transfers 4
+          rclone copy repo/pool r2:apt/pool --transfers 4

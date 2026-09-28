@@ -1,0 +1,109 @@
+# passt 镜像源：为 Ubuntu 22.04 (jammy) 提供 passt/pasta（jammy 归档无此包）。
+#
+# Docker 官方源同款模型：上游不发布二进制，我们在钉定的上游 tag 上以 jammy
+# 环境源码编译，打包为 passt_<ver>-1iso1_amd64.deb，发布到 apt.samuka007.com
+# 的 `passt` 组件（suite 仍为 stable）。jammy 客户端：
+#   deb [signed-by=...] https://apt.samuka007.com stable main passt
+#
+# 安全更新义务：上游/Ubuntu 出 passt 安全修复时需手动重跑本 workflow（改
+# PASST_TAG）。本 workflow 与 release.yml 共用 dists/stable，均为增量合并：
+# 先 rclone 拉取现有 registry，再补 pool、全量重建索引、重签、推回。
+name: passt
+
+on:
+  workflow_dispatch:
+    inputs:
+      passt_tag:
+        description: "upstream passt tag to build"
+        required: false
+        default: "2024_02_20.1e6f92b"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    env:
+      PASST_TAG: ${{ inputs.passt_tag || '2024_02_20.1e6f92b' }}
+    steps:
+      - name: build passt from pinned upstream tag
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git gcc make libcap-dev >/dev/null
+          git clone --depth 1 --branch "$PASST_TAG" https://passt.top/passt /src
+          cd /src
+          make
+          install -Dm755 passt /out/passt
+          install -Dm755 pasta /out/pasta
+      - uses: actions/upload-artifact@v4
+        with:
+          name: passt-bin
+          path: /out
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: passt-bin
+          path: bin
+      - name: package deb
+        run: |
+          set -euo pipefail
+          mkdir -p pkg/DEBIAN pkg/usr/bin
+          cp bin/passt bin/pasta pkg/usr/bin/
+          cat > pkg/DEBIAN/control <<'EOF'
+          Package: passt
+          Version: 0.0~git20240220.1e6f92b-1iso1
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Samuka007 <1309573889+Samuka007@users.noreply.github.com>
+          Depends: libc6 (>= 2.35), libcap2 (>= 1:2.27)
+          Description: copy/paste traffic into a network namespace (iso-cc mirror build)
+           Unofficial rebuild of passt/pasta for Ubuntu 22.04 (jammy), which does not
+           ship passt in its archive. Built from upstream tag 2024_02_20.1e6f92b.
+          EOF
+          find pkg -exec touch -d @0 {} +
+          dpkg-deb --build --root-owner-group pkg passt_0.0~git20240220.1e6f92b-1iso1_amd64.deb
+      - name: publish deb → APT registry (R2, component passt)
+        env:
+          APT_ACCOUNT_ID: ${{ secrets.APTLINE_R2_ENDPOINT }}
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.APTLINE_R2_ENDPOINT }}.r2.cloudflarestorage.com
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.APTLINE_R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.APTLINE_R2_SECRET_ACCESS_KEY }}
+          GPG_PRIVATE_KEY: ${{ secrets.APTLINE_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone apt-utils >/dev/null
+          [ -z "$APT_ACCOUNT_ID" ] && { echo "::warning::APT registry secrets 未配置，跳过发布"; exit 0; }
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          # 增量合并：拉现有 registry → 补 pool → 全量重建索引 → 重签 → 推回
+          rclone copy r2:apt repo --transfers 4
+          mkdir -p repo/pool/passt/i/passt repo/dists/stable/passt/binary-amd64 repo/dists/stable/main/binary-amd64
+          cp passt_*.deb repo/pool/passt/i/passt/
+          ( cd repo && apt-ftparchive packages pool/passt > dists/stable/passt/binary-amd64/Packages )
+          gzip -9n -k repo/dists/stable/passt/binary-amd64/Packages
+          # main 组件索引从拉回的池重建（池为权威，dist 冗余重算无妨）
+          ( cd repo && apt-ftparchive packages pool/main > dists/stable/main/binary-amd64/Packages )
+          gzip -9n -k repo/dists/stable/main/binary-amd64/Packages
+          ( cd repo && apt-ftparchive -o "APT::FTPArchive::Release::Date=$(date -u +'%a, %d %b %Y %H:%M:%S UTC')" \
+            -o APT::FTPArchive::Release::Origin=iso-cc \
+            -o APT::FTPArchive::Release::Label=iso-cc \
+            -o APT::FTPArchive::Release::Suite=stable \
+            -o APT::FTPArchive::Release::Codename=stable \
+            -o APT::FTPArchive::Release::Architectures=amd64 \
+            -o APT::FTPArchive::Release::Components=main passt \
+            -o "APT::FTPArchive::Release::Description=iso-cc APT registry" \
+            release dists/stable > dists/stable/Release )
+          sed -i -E '/ [0-9]+ Release$/d' repo/dists/stable/Release
+          gpg --batch --yes --clearsign --output repo/dists/stable/InRelease repo/dists/stable/Release
+          gpg --batch --yes --armor --detach-sign --output repo/dists/stable/Release.gpg repo/dists/stable/Release
+          rclone copy repo/dists r2:apt/dists --transfers 4
+          rclone copy repo/pool r2:apt/pool --transfers 4
