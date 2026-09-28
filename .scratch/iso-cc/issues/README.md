@@ -44,6 +44,7 @@
 | 21 execrpc-nix-sandbox-test | done（2026-09-27：host_shell 解析器 + 沙箱守卫，nix build 全绿亲验） | — |
 | 22 remove-mcp-fallback | done（2026-09-27 亲验：兜底删除、P-MCP 两态化、BREAKING 进 CHANGELOG） | — |
 | 23 playwright-driver-exploration | 探究待派（已按用户收窄：仅『会话内 Playwright 驱动宿主已登录 Chrome』用例，1235 删） | — |
+| 26 no-inject-l3-interception | ready——已 handoff 邻居实现（/tmp/iso-cc-handoff-ticket26.md；ADR0008 附4 已记） | 15/25✅ |
 
 ## 邻位协作（herdr 双 agent，w12 workspace）——协议已接受并执行
 
