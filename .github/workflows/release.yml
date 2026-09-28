@@ -145,6 +145,7 @@ jobs:
         env:
           APT_ACCOUNT_ID: ${{ secrets.APTLINE_R2_ENDPOINT }}
           RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
           RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.APTLINE_R2_ENDPOINT }}.r2.cloudflarestorage.com
           RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.APTLINE_R2_ACCESS_KEY_ID }}
           RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.APTLINE_R2_SECRET_ACCESS_KEY }}
