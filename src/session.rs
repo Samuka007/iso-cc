@@ -222,11 +222,15 @@ pub fn spawn(profile_name: &str, profile: &Profile, mode: ChildMode) -> anyhow::
         // mark 会话可见资产（exec.sock/shim）落 mark 状态根（uid 4210 可遍历；
         // 宿主 $HOME 0700 链路不可达——票 18 宿主矩阵实测）。
         let mark_sess_dir = crate::mark::sessions_root().join(&session_id);
-        std::fs::create_dir_all(&mark_sess_dir).with_context(|| {
-            format!("创建 mark 会话资产目录 {}", mark_sess_dir.display())
-        })?;
+        std::fs::create_dir_all(&mark_sess_dir)
+            .with_context(|| format!("创建 mark 会话资产目录 {}", mark_sess_dir.display()))?;
         let exec_channel = match profile.exec_bash() {
-            ExecBash::Host => Some(execrpc::prepare(&mark_sess_dir, profile, &session_id, true)?),
+            ExecBash::Host => Some(execrpc::prepare(
+                &mark_sess_dir,
+                profile,
+                &session_id,
+                true,
+            )?),
             ExecBash::Sandbox => None,
         };
         let ctx = SpawnCtx {
@@ -946,9 +950,7 @@ fn apply_env(cmd: &mut Command, profile: &Profile, exec: Option<&execrpc::ExecCh
         // NixOS 宿主矩阵：tzdata 在 /etc/zoneinfo，TZDIR 只在 login env（会话
         // 常缺失）——缺失且该根有所声明时区数据时补齐，否则 glibc 解析 TZ 失败
         // 回落 UTC（P6a 实测 +0000）。引擎无关（env 面，不依赖 mountns bind）。
-        if std::env::var_os("TZDIR").is_none()
-            && Path::new("/etc/zoneinfo").join(tz).exists()
-        {
+        if std::env::var_os("TZDIR").is_none() && Path::new("/etc/zoneinfo").join(tz).exists() {
             cmd.env("TZDIR", "/etc/zoneinfo");
         }
     }
