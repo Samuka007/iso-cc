@@ -969,6 +969,25 @@ fn apply_env(cmd: &mut Command, profile: &Profile, exec: Option<&execrpc::ExecCh
         cmd.env("LANG", lang);
         cmd.env("LC_ALL", lang);
     }
+    // 防出口泄露（操作者 2026-09-28）：宿主 PROXY 族 env 不入会话——egress 声明
+    // （if:/socks5:）是唯一出口语义；宿主代理地址漏入 = cc 流量旁路隧道走代理
+    // （出口身份错乱）或 netns 内不可达报错。netns 形态 pasta 透明接管 + socks
+    // 形态 tun2proxy 0.0.0.0/1 接管均无需代理 env。用户显式 [profile.*.env] 声明
+    // 的代理项随后原样覆盖（显式声明胜）。
+    for v in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "FTP_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "ftp_proxy",
+        "no_proxy",
+    ] {
+        cmd.env_remove(v);
+    }
     for (k, v) in &profile.env {
         cmd.env(k, v);
     }
