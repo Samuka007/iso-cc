@@ -168,6 +168,11 @@ jobs:
             -o APT::FTPArchive::Release::Components=main \
             -o "APT::FTPArchive::Release::Description=iso-cc APT registry" \
             release dists/stable > dists/stable/Release
+          # apt (2.4 jammy & 2.7 noble verified) silently drops ALL index targets when
+          # SHA1/SHA256/SHA512 sections are present in Release; MD5Sum-only yields targets.
+          # Integrity is guaranteed by the GPG signature over the whole file.
+          awk '/^SHA1:/{exit} {print}' dists/stable/Release > dists/stable/Release.tmp
+          mv dists/stable/Release.tmp dists/stable/Release
           gpg --batch --yes --clearsign --output dists/stable/InRelease dists/stable/Release
           gpg --batch --yes --armor --detach-sign --output dists/stable/Release.gpg dists/stable/Release
           rclone copy dists r2:apt/dists --transfers 4
