@@ -160,7 +160,8 @@ jobs:
           cp dist/iso-cc-*.deb pool/main/i/iso-cc/
           apt-ftparchive packages pool > dists/stable/main/binary-amd64/Packages
           gzip -9n dists/stable/main/binary-amd64/Packages
-          apt-ftparchive -o APT::FTPArchive::Release::Origin=iso-cc \
+          apt-ftparchive -o "APT::FTPArchive::Release::Date=$(date -u +'%a, %d %b %Y %H:%M:%S UTC')" \
+            -o APT::FTPArchive::Release::Origin=iso-cc \
             -o APT::FTPArchive::Release::Label=iso-cc \
             -o APT::FTPArchive::Release::Suite=stable \
             -o APT::FTPArchive::Release::Codename=stable \
