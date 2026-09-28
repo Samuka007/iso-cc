@@ -59,3 +59,9 @@ shim 实现采用 **multi-call 模式**：bind 上去的就是 iso-cc 自身（a
 ## 附 3：二进制取证修正（claude-code 2.1.263，2026-09-26）
 
 cc 实测主路径确认为 L1（读 `process.env.SHELL`，fallback `SHELL||COMSPEC||...`，二进制含 `/bin/bash`、`/usr/bin/bash` 字面量兜底 → L3 补齐）。**但**：Hooks、REPL `!cmd`、skill `!cmd`、statusline 全部硬编码 `/bin/sh -c`，不走 `$SHELL`——L1/L2/L3（针对 bash 的）不覆盖这些面，self 范围下它们留 netns 直跑。官方 `CLAUDE_CODE_SHELL_PREFIX` env（实测覆盖 Bash 工具/hooks/statusline/stdio MCP）是更完备的拦截层候选——登记为 L1.5，实现时优先验证。D8 例外表需显式声明：hooks/statusline/REPL 面 + WebSearch（服务端执行，无客户端网络）+ WebFetch（cc 进程 fetch，拒绝 localhost + api.anthropic.com preflight）。详见 ../iso-cc-research/2026-09-26-cc-tool-surface.md。
+
+## 附 4：L1.5 注入取消，L3 bind 升为主拦截（2026-09-28）
+
+操作者裁定：显式注入 `CLAUDE_CODE_SHELL_PREFIX` 等于向 cc 自陈 hook 行为（env 是公开面，cc 与任意子进程可读）。票 24 源码级取证同时证实：stdio MCP spawn 为 **shell:false 直接 execvp 裸名 `npx`**，不经任何 shell——L2 PATH 前置即可拦截；Bash 工具/hooks/statusline 的硬编码路径由 L3 mountns bind（/bin/bash、/usr/bin/bash、/bin/sh → 会话 shim）拦截。
+
+处置：host 模式取消 L1.5 注入；L1.5 降级为 L3 不可用环境（无 mountns bind 权限面）的备选。保留 env：`SHELL`（指向会话 bin，自然形态）、`PATH` 前置（自然形态）、`ISO_CC_SESSION`/`ISO_CC_EXEC_SOCK`（无 hook 点名语义；路径推导去 env 化列后续票）。详见票 26。
