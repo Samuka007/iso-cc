@@ -359,7 +359,11 @@ pub(crate) fn url_loopback_port(url: &str) -> Option<u16> {
     if port == 0 {
         return None;
     }
-    matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1").then_some(port)
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
+    .then_some(port)
 }
 
 impl Profile {

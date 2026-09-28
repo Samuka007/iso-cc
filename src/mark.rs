@@ -121,7 +121,9 @@ fn fnv64(data: &str) -> u64 {
 /// /usr/share/zoneinfo 即可，无需 TZDIR）。存在 = 编译期钉入助手（secure-exec
 /// 过滤剥 TZDIR 的重建源，见 mark-uidrun.c restore_tzdir）。
 fn host_tzdir() -> Option<&'static str> {
-    Path::new("/etc/zoneinfo").is_dir().then_some("/etc/zoneinfo")
+    Path::new("/etc/zoneinfo")
+        .is_dir()
+        .then_some("/etc/zoneinfo")
 }
 
 fn helper_meta_want() -> String {
@@ -167,7 +169,12 @@ pub fn ensure_helper() -> anyhow::Result<bool> {
     let tmp = dir.join(format!(".{HELPER_NAME}.compile.tmp"));
     let _ = std::fs::remove_file(&tmp);
     let out = Command::new(&cc)
-        .args(["-O2", "-std=c11", "-Wall", &format!("-DMARK_UID={MARK_UID}")])
+        .args([
+            "-O2",
+            "-std=c11",
+            "-Wall",
+            &format!("-DMARK_UID={MARK_UID}"),
+        ])
         .args(host_tzdir().map(|d| format!("-DMARK_TZDIR=\"{d}\"")))
         .arg("-o")
         .arg(&tmp)

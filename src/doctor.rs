@@ -2093,17 +2093,21 @@ mod tests {
     fn mark_manifest() -> Vec<crate::manifest::Entry> {
         let mut m = vec![mentry("pasta", "/usr/bin/fake", Some("1.0.0"))]
             .into_iter()
-            .chain(crate::config::cc_builtin_pairs("sg").into_iter().map(|pair| {
-                // mark 引擎：backing 落 mark 状态根（cc_builtin_pairs_mark 推导一致）
-                crate::manifest::Entry {
-                    kind: crate::manifest::EntryKind::ProfileState,
-                    key: crate::setup::profile_state_key("sg", pair.key),
-                    path: Some(crate::mark::profiles_root().join("sg").join(pair.key)),
-                    version: None,
-                    registered_at: 1_760_000_000_000,
-                    reason: "测试登记".into(),
-                }
-            }))
+            .chain(
+                crate::config::cc_builtin_pairs("sg")
+                    .into_iter()
+                    .map(|pair| {
+                        // mark 引擎：backing 落 mark 状态根（cc_builtin_pairs_mark 推导一致）
+                        crate::manifest::Entry {
+                            kind: crate::manifest::EntryKind::ProfileState,
+                            key: crate::setup::profile_state_key("sg", pair.key),
+                            path: Some(crate::mark::profiles_root().join("sg").join(pair.key)),
+                            version: None,
+                            registered_at: 1_760_000_000_000,
+                            reason: "测试登记".into(),
+                        }
+                    }),
+            )
             .collect::<Vec<_>>();
         m.push(crate::manifest::Entry {
             kind: crate::manifest::EntryKind::CapBin,
@@ -2270,14 +2274,17 @@ mod tests {
         assert_eq!(c.status, Status::Warn, "{}", c.detail);
         assert!(c.detail.contains("8908"), "{}", c.detail);
         assert!(c.detail.contains("重启 cc 或先起服务"), "{}", c.detail);
-        assert!(!c.detail.contains("socat"), "兜底文案必须消失：{}", c.detail);
+        assert!(
+            !c.detail.contains("socat"),
+            "兜底文案必须消失：{}",
+            c.detail
+        );
     }
 
     #[test]
     fn mcp_check_mark_engine_skips() {
         // mark 引擎 SKIP 取证（票 20 spec#4）
-        let p: Profile =
-            toml::from_str("egress = 'if:wg0'\nnet.engine = 'mark'").unwrap();
+        let p: Profile = toml::from_str("egress = 'if:wg0'\nnet.engine = 'mark'").unwrap();
         let c = mcp_loopback_check("x", &p, &RealSys);
         assert_eq!(c.status, Status::Ok);
         assert!(c.detail.contains("mark 引擎 SKIP"), "{}", c.detail);

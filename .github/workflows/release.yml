@@ -132,14 +132,8 @@ jobs:
             dist/iso-cc-* dist/sha256sums.txt
 
   publish:
-    # 工单 21：deb → APT registry（aptline，R2 后端；本票交付形态 = dry-run，
-    # 全链已在 aptline 仓本地验收）。双重门：
-    # - job 级 gate：secrets 未配置 → skip + ::warning::，job 绿。这同时覆盖
-    #   aptline 仓尚未推送 GitHub 的窗口期（step 级 if 为 false 时 runner 不
-    #   解析 uses，占位 slug 不会弄挂 release 流水线）；凭据到位即激活，
-    #   零改码（APTLINE_OWNER 已替换为 Samuka007，2026-09-27）。
-    # - action 内 ci-gate：通用消费者契约（见 aptline/action/action.yml）。
-    # R2 三元组经 rclone env 注入（profile 名 r2，对应 --r2 r2:<bucket>）。
+    # deb → APT registry（R2）：apt-ftparchive 索引 + gpg 签名 + rclone 上传。
+    # secrets 缺失时 skip（不挡发版）。
     runs-on: ubuntu-latest
     needs: packages
     steps:
@@ -147,29 +141,33 @@ jobs:
         with:
           name: iso-cc-deb
           path: dist
-      - id: gate
+      - name: publish deb → APT registry (R2)
         env:
-          APTLINE_R2_TARGET: ${{ secrets.APTLINE_R2_TARGET }}
-          APTLINE_GPG_PRIVATE_KEY: ${{ secrets.APTLINE_GPG_PRIVATE_KEY }}
-        run: |
-          if [ -z "$APTLINE_R2_TARGET" ] || [ -z "$APTLINE_GPG_PRIVATE_KEY" ]; then
-            echo "decision=skip" >> "$GITHUB_OUTPUT"
-            echo "::warning::aptline: secrets APTLINE_R2_TARGET / APTLINE_GPG_PRIVATE_KEY 未配置 — APT registry 发布跳过（配置即激活，零改码）"
-          else
-            echo "decision=publish" >> "$GITHUB_OUTPUT"
-          fi
-      - name: publish deb → APT registry (aptline)
-        if: steps.gate.outputs.decision == 'publish'
-        uses: Samuka007/aptline/action@v0
-        with:
-          component: iso-cc
-          debs-glob: dist/iso-cc-*.deb
-          suite: stable
-          r2-target: ${{ secrets.APTLINE_R2_TARGET }}
-          gpg-private-key: ${{ secrets.APTLINE_GPG_PRIVATE_KEY }}
-          gpg-passphrase: ${{ secrets.APTLINE_GPG_PASSPHRASE }}
-        env:
+          APT_ACCOUNT_ID: ${{ secrets.APTLINE_R2_ENDPOINT }}
           RCLONE_CONFIG_R2_TYPE: s3
-          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.APTLINE_R2_ENDPOINT }}
+          RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.APTLINE_R2_ENDPOINT }}.r2.cloudflarestorage.com
           RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.APTLINE_R2_ACCESS_KEY_ID }}
           RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.APTLINE_R2_SECRET_ACCESS_KEY }}
+          GPG_PRIVATE_KEY: ${{ secrets.APTLINE_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq rclone apt-utils >/dev/null
+          [ -z "$APT_ACCOUNT_ID" ] && { echo "::warning::APT registry secrets 未配置，跳过发布"; exit 0; }
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          KEY_ID=$(gpg --list-secret-keys --with-colons | grep '^fpr' | head -1 | cut -d: -f10)
+          mkdir -p pool/main/i/iso-cc dists/stable/main/binary-amd64
+          cp dist/iso-cc-*.deb pool/main/i/iso-cc/
+          apt-ftparchive packages pool > dists/stable/main/binary-amd64/Packages
+          gzip -9n dists/stable/main/binary-amd64/Packages
+          apt-ftparchive -o APT::FTPArchive::Release::Origin=iso-cc \
+            -o APT::FTPArchive::Release::Label=iso-cc \
+            -o APT::FTPArchive::Release::Suite=stable \
+            -o APT::FTPArchive::Release::Codename=stable \
+            -o APT::FTPArchive::Release::Architectures=amd64 \
+            -o APT::FTPArchive::Release::Components=main \
+            -o "APT::FTPArchive::Release::Description=iso-cc APT registry" \
+            release dists/stable > dists/stable/Release
+          gpg --batch --yes --clearsign --output dists/stable/InRelease dists/stable/Release
+          gpg --batch --yes --armor --detach-sign --output dists/stable/Release.gpg dists/stable/Release
+          rclone copy dists r2:apt/dists --transfers 4
+          rclone copy pool r2:apt/pool --transfers 4
