@@ -52,10 +52,6 @@ pub fn classify(argv0: Option<&OsStr>) -> StubKind {
     StubKind::Argv
 }
 
-pub fn is_stub_invocation(argv0: Option<&OsStr>) -> bool {
-    classify(argv0) != StubKind::Cli
-}
-
 /// 从 argv（已去 argv0）解析转发脚本。见模块注释的三形态；`-c` 后容 flag 段
 ///（票 25 G1a，现知 `-l`）；无法识别 = Err（126）。
 pub fn parse_script(args: &[OsString]) -> Result<OsString, String> {

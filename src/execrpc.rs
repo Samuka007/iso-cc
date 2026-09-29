@@ -159,9 +159,6 @@ struct WorkerSpec {
 /// 已装配未启动的通道（spawn 早期调用 [`prepare`]，网关 spawn 成功后调
 /// [`ExecChannel::serve`]）。
 pub struct ExecChannel {
-    /// L1/L1.5 注入的 shell 路径 = `<sess>/bin/bash`（multi-call shim 符号链接 →
-    /// iso-cc；票 26 起 env 值面恒写经典路径 `/bin/bash`，经 L3 bind 即本 shim）。
-    pub shell_path: PathBuf,
     /// L2 PATH shim 目录 = `<sess>/bin`。
     pub bin_dir: PathBuf,
     /// RPC socket 路径（ISO_CC_EXEC_SOCK 注入值）。
@@ -240,7 +237,6 @@ pub fn prepare(
         .with_context(|| format!("chmod {sock_mode:o} {}", sock_path.display()))?;
     let vars = Arc::new(worker_env_vars(profile, session_id, &sock_path));
     Ok(ExecChannel {
-        shell_path,
         bin_dir,
         sock_path,
         listener,
