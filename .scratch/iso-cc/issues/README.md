@@ -60,6 +60,8 @@
 
 | 24 L15-stdio-MCP-grounding | ready（L1.5×stdio MCP 常驻链从未实测；@playwright/mcp 真负载逐跳 grounding） | — |
 
+| 27 installer-readme-exe-relative | done（2026-09-29 亲验：install/uninstall 环路 + exe-relative 层稀疏 PATH e2e + README 重写 146 测试） | — |
+
 ## 收尾态（2026-09-27，二次收口）
 
 **全部实现票完成**（01-05、08-25 done；探针 141+2、双引擎、三形态出口）。剩余需外部输入：
