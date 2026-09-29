@@ -88,23 +88,51 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// 第二层：`ISO_CC_HELPER_DIR` 指向的目录内按候选名找可执行。
-fn env_dir_bin(name: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os(HELPER_DIR_ENV)?);
+/// 目录内按候选名找可执行（env 目录与 exe-relative libexec 两层共用）。
+fn dir_bin(dir: &Path, name: &str) -> Option<PathBuf> {
     bin_candidates(name).into_iter().find_map(|b| {
         let cand = dir.join(b);
         is_executable(&cand).then_some(cand)
     })
 }
 
+/// 第二层：`ISO_CC_HELPER_DIR` 指向的目录内按候选名找可执行。
+fn env_dir_bin(name: &str) -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os(HELPER_DIR_ENV)?);
+    dir_bin(&dir, name)
+}
+
+/// 第三层（工单 27）：exe-relative libexec —— `<exe_dir>/../lib/iso-cc/libexec`。
+/// exe 路径先 canonicalize 解析符号链接：`PREFIX/bin/iso-cc` 即便被包管理器/用户
+/// symlink 转发，也命中真实安装前缀的 libexec（对应 install.sh 布局
+/// `PREFIX/bin/iso-cc` + `PREFIX/lib/iso-cc/libexec/`）。dev/nix 构建该层自然
+/// 不存在，回落 PATH 无害。
+fn exe_relative_bin(exe: &Path, name: &str) -> Option<PathBuf> {
+    let resolved = std::fs::canonicalize(exe).ok()?;
+    let exe_dir = resolved.parent()?;
+    let dir = exe_dir.parent()?.join("lib/iso-cc/libexec");
+    dir_bin(&dir, name)
+}
+
+/// manifest 之后的回落序（次序即优先级）：`ISO_CC_HELPER_DIR` > exe-relative
+/// libexec > PATH。exe 路径由调用方传入（pinned_bin 给 current_exe；测试给伪造
+/// 布局）。
+fn fallback_after_manifest(exe: Option<&Path>, name: &str) -> Option<PathBuf> {
+    env_dir_bin(name)
+        .or_else(|| exe.and_then(|e| exe_relative_bin(e, name)))
+        .or_else(|| which_any(&bin_candidates(name)))
+}
+
 /// provider 可执行解析门（工单 08 设计 #3 优先级链）：
-/// **manifest 钉路径 > `ISO_CC_HELPER_DIR` env > PATH**（对标 podman
-/// `CONTAINERS_HELPER_BINARY_DIR`；14 实现了首尾两层，08 补 env 层）。
+/// **manifest 钉路径 > `ISO_CC_HELPER_DIR` env > `<exe_dir>/../lib/iso-cc/libexec` >
+/// PATH**（对标 podman `CONTAINERS_HELPER_BINARY_DIR`；14 实现了首尾两层，
+/// 08 补 env 层，27 补 install.sh bundle 安装布局层）。
 ///
 /// - manifest 可读且有本 provider 条目 → 钉定路径唯一裁决：path 缺失（清单损坏）
 ///   或不可执行 = Fail（漂移不静默穿透，提示 setup 收敛）；
-/// - 清单缺失（bundle 新装）或无本条目 → 依次落 env 目录、PATH；
-/// - 三层全空 = Fail：提示 setup / env 目录两条修复路径（仍无任何静默回落）。
+/// - 清单缺失（bundle 新装）或无本条目 → 依次落 env 目录、exe-relative libexec、
+///   PATH（bundle 经 install.sh 装到 PREFIX 后零配置命中）；
+/// - 四层全空 = Fail：提示 setup / install.sh / env 目录修复路径（仍无任何静默回落）。
 ///
 /// gateway（pasta/slirp4netns）与 socks worker（tun2proxy）共用本门。
 pub fn pinned_bin(name: &str) -> anyhow::Result<PathBuf> {
@@ -128,16 +156,15 @@ pub fn pinned_bin(name: &str) -> anyhow::Result<PathBuf> {
             return Ok(path);
         }
     }
-    if let Some(path) = env_dir_bin(name) {
-        return Ok(path);
-    }
-    if let Some(path) = which_any(&bin_candidates(name)) {
+    let exe = std::env::current_exe().ok();
+    if let Some(path) = fallback_after_manifest(exe.as_deref(), name) {
         return Ok(path);
     }
     anyhow::bail!(
-        "provider {name} 未解析（fail-loud #2）：优先级链 清单钉路径 > {HELPER_DIR_ENV} > PATH \
-         全部落空——先运行 `iso-cc setup`（发行版原生包形态），或设 {HELPER_DIR_ENV} 指向 \
-         bundle 解包目录的 libexec/（bundle 形态）"
+        "provider {name} 未解析（fail-loud #2）：优先级链 清单钉路径 > {HELPER_DIR_ENV} > \
+         <exe_dir>/../lib/iso-cc/libexec > PATH 全部落空——`iso-cc setup`（发行版原生包形态）、\
+         install.sh bundle 安装（PREFIX/bin + PREFIX/lib/iso-cc/libexec），或设 \
+         {HELPER_DIR_ENV} 指向 bundle 解包目录的 libexec/"
     )
 }
 
@@ -181,4 +208,125 @@ pub fn host_iface_up(name: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 伪造 install.sh 安装布局：`<root>/bin/iso-cc`（exe 占位）+
+    /// `<root>/lib/iso-cc/libexec/<helper>`（可执行占位）。返回伪 exe 路径。
+    fn fake_install_layout(root: &Path, helper: &str) -> PathBuf {
+        let exe = root.join("bin/iso-cc");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        let helper_path = root.join("lib/iso-cc/libexec").join(helper);
+        std::fs::create_dir_all(helper_path.parent().unwrap()).unwrap();
+        std::fs::write(&helper_path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            &helper_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        exe
+    }
+
+    #[test]
+    fn exe_relative_layer_hits_installed_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = fake_install_layout(tmp.path(), "pasta");
+        assert_eq!(
+            exe_relative_bin(&exe, "pasta").unwrap(),
+            tmp.path().join("lib/iso-cc/libexec/pasta")
+        );
+    }
+
+    #[test]
+    fn exe_relative_layer_resolves_symlinked_exe() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 真实安装前缀 opt/iso-cc-0.1.0；usr/local/bin/iso-cc 为 symlink 转发
+        //（包管理器版本化目录形态）——canonicalize 后命中真实前缀的 libexec。
+        let real = tmp.path().join("opt/iso-cc-0.1.0");
+        let exe = fake_install_layout(&real, "slirp4netns");
+        let link = tmp.path().join("usr/local/bin/iso-cc");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+        assert_eq!(
+            exe_relative_bin(&link, "slirp4netns").unwrap(),
+            real.join("lib/iso-cc/libexec/slirp4netns")
+        );
+    }
+
+    #[test]
+    fn exe_relative_layer_misses_without_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 无 libexec 目录 → None
+        let exe = tmp.path().join("bin/iso-cc");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"").unwrap();
+        assert!(exe_relative_bin(&exe, "pasta").is_none());
+        // exe 无父前缀（根直下）→ None
+        let flat = tmp.path().join("flat-iso-cc");
+        std::fs::write(&flat, b"").unwrap();
+        assert!(exe_relative_bin(&flat, "pasta").is_none());
+    }
+
+    #[test]
+    fn env_layer_beats_exe_relative_then_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = tmp.path().join("inst");
+        let exe = fake_install_layout(&inst, "pasta"); // exe-relative 层可命中
+
+        let env_dir = tmp.path().join("envdir");
+        std::fs::create_dir_all(&env_dir).unwrap();
+        let env_pasta = env_dir.join("pasta");
+        std::fs::write(&env_pasta, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&env_pasta, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path_dir = tmp.path().join("pathdir");
+        std::fs::create_dir_all(&path_dir).unwrap();
+        let path_pasta = path_dir.join("pasta");
+        std::fs::write(&path_pasta, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path_pasta, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let old_env = std::env::var_os(HELPER_DIR_ENV);
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(HELPER_DIR_ENV, &env_dir);
+        std::env::set_var("PATH", &path_dir);
+
+        // 三层同时可命中：env 优先（票面优先级序断言）
+        assert_eq!(
+            fallback_after_manifest(Some(&exe), "pasta").unwrap(),
+            env_pasta
+        );
+
+        // env 目录存在但无候选名 → 落 exe-relative（次优先）
+        let empty_env = tmp.path().join("empty-env");
+        std::fs::create_dir_all(&empty_env).unwrap();
+        std::env::set_var(HELPER_DIR_ENV, &empty_env);
+        assert_eq!(
+            fallback_after_manifest(Some(&exe), "pasta").unwrap(),
+            inst.join("lib/iso-cc/libexec/pasta")
+        );
+
+        // exe-relative 布局缺失 → PATH 兜底
+        let bare = tmp.path().join("bare");
+        let bare_exe = bare.join("bin/iso-cc");
+        std::fs::create_dir_all(bare_exe.parent().unwrap()).unwrap();
+        std::fs::write(&bare_exe, b"").unwrap();
+        assert_eq!(
+            fallback_after_manifest(Some(&bare_exe), "pasta").unwrap(),
+            path_pasta
+        );
+
+        // 恢复进程全局 env（nextest 每 test 一进程本无此虑；cargo test 同进程跑时自愈）
+        match old_env {
+            Some(v) => std::env::set_var(HELPER_DIR_ENV, v),
+            None => std::env::remove_var(HELPER_DIR_ENV),
+        }
+        match old_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+    }
 }

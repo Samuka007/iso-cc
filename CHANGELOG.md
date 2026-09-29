@@ -21,6 +21,10 @@
 - setup/gc/doctor：两级资源模型（session-scoped / setup-manifested / residue=0），清单双向校验
 - verify：P1/P2/P3b/P6/P8/P13/P15 + P-MCP；socks 形态下全绿（SG 出口）
 
+### 安装（票 27）
+- `packaging/install.sh`（POSIX sh，装/卸）：GitHub Release 拉 bundle + `sha256sums.txt` 强校验；`--from <dir|tar.gz>` 离线模式；`PREFIX` 可覆盖（默认 /usr/local）；幂等覆盖安装，装完 `iso-cc --version` 自证
+- exe-relative libexec 解析层：`pinned_bin` 优先级链插入第三层——manifest 钉路径 > `ISO_CC_HELPER_DIR` > `<exe_dir>/../lib/iso-cc/libexec`（current_exe 解析符号链接）> PATH；bundle 经 install.sh 装到 PREFIX 后零配置命中（无需 `ISO_CC_HELPER_DIR`、无 PATH 依赖）；dev/nix 构建该层自然不存在，回落 PATH 无害
+
 ### BREAKING（相对无 CHANGELOG 前的内部版本）
 - `net.mcp_fallback` 键已删除（快照缺口不再自动兜底），旧配置拒绝解析
 - 依赖降级：deb/rpm/apk `Depends` 仅 passt（slirp4netns→Suggests，tun2proxy→Recommends）
