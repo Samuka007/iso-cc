@@ -223,11 +223,7 @@ mod tests {
         let helper_path = root.join("lib/iso-cc/libexec").join(helper);
         std::fs::create_dir_all(helper_path.parent().unwrap()).unwrap();
         std::fs::write(&helper_path, b"#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(
-            &helper_path,
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         exe
     }
 
