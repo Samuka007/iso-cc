@@ -118,8 +118,9 @@ jobs:
           cat > release-notes.md <<'EOF'
           ## 安装
 
-          - **发行版原生包**（依赖下放发行版）：deb/rpm/apk；`Depends: passt, slirp4netns`（版本下限见包元数据），`Recommends: tun2proxy`（socks5 形态增强）。
-          - **bundle**（零发行版依赖）：`tar xzf iso-cc-bundle-*.tar.gz && cd iso-cc-bundle-*`，运行前 `export ISO_CC_HELPER_DIR=$PWD/libexec`（无 setup、无 PATH 依赖，helper sha256 钉定校验随包构建）。
+          - **一键脚本**（推荐，任意发行版）：`curl -fsSL https://raw.githubusercontent.com/Samuka007/iso-cc/main/packaging/install.sh | sh -s -- install 0.2.0`——装 `/usr/local/bin/iso-cc` + `/usr/local/lib/iso-cc/libexec/`（sha256 校验；卸载把 `install` 换成 `uninstall`）。
+          - **发行版原生包**（依赖下放发行版）：deb/rpm/apk；`Depends: passt`，`Recommends: tun2proxy`（socks5 形态），`Suggests: slirp4netns`（回退 provider）。
+          - **bundle**（零发行版依赖）：`tar xzf iso-cc-bundle-*.tar.gz && cd iso-cc-bundle-*`——exe-relative 解析零配置；或 `export ISO_CC_HELPER_DIR=$PWD/libexec`。
 
           ## 完整性
 

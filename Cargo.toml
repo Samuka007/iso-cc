@@ -1,6 +1,6 @@
 [package]
 name = "iso-cc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Rootless declarative sandbox sessions for Claude Code: egress pinning + locale override + CC config isolation"
 license = "MIT"

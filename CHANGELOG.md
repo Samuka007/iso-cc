@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0（2026-09-29）
+
+- 拦截去注入化：L3 mountns bind（/bin/bash、/usr/bin/bash、/bin/sh → 会话 shim）+ L2 承担全部拦截；会话 env 零 hook 点名变量（BREAKING：CLAUDE_CODE_SHELL_PREFIX 不再注入）
+- Bash 工具 host 轴阻断级修复：`-l` flag 容忍 + 二跳 sock 注入（stdio MCP 常驻链同票实测全绿）
+- exe-relative 解析层：manifest > ISO_CC_HELPER_DIR > <exe_dir>/../lib/iso-cc/libexec > PATH——install.sh 安装布局零配置解析
+- packaging/install.sh：install/uninstall、sha256 校验、PREFIX 覆盖、--from 离线模式
+- PROXY 族 env scrub（防出口配置泄漏经继承代理绕过隧道）
+- MCP 快照缺口兜底删除（契约：服务先起或重启 cc；BREAKING：net.mcp_fallback 键删除）
+- README 全面重写；依赖降级（Depends 仅 passt；slirp4netns→Suggests，tun2proxy→Recommends）
+
 ## 0.1.0（2026-09-27）
 
 首个可用里程碑：rootless 声明式沙箱会话，双引擎 + 三形态出口 + 全绿 verify（SG 出口形态）。
